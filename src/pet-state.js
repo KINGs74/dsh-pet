@@ -119,6 +119,8 @@ export class PetModel {
     this.status = PetStatus.unknown;
     this.lastText = '';
     this.lastUser = '';
+    // 演练文案只挂在提醒上，绝不写进 lastText —— 否则演练完气泡会一直停在"退出码 1"上
+    this.rehearsal = '';
     this.alert = null;
     this.ackedId = '';
     this.turnStartedAt = 0;
@@ -196,6 +198,7 @@ export class PetModel {
           this.status = PetStatus.running;
           // 新一轮开始时清掉上一轮的结论，否则气泡会一直停在上一轮的答案上
           this.lastText = '';
+          this.rehearsal = '';
         }
         break;
       }
@@ -225,6 +228,7 @@ export class PetModel {
           this.turnStartedAt = this.now();
           this.endedAt = 0;
           this.alert = null;
+          this.rehearsal = '';
         }
         break;
       }
@@ -322,6 +326,7 @@ export class PetModel {
     if (alertId && this.alert.id !== alertId) return;
     this.ackedId = this.alert.id;
     this.alert = null;
+    this.rehearsal = '';
     this.updatedAt = this.now();
   }
 
@@ -337,7 +342,7 @@ export class PetModel {
     if (!success) {
       const table = ALERT_TEXT[kind] ?? ALERT_TEXT.error;
       const label = table[this.lang] ?? table.zh;
-      this.lastText = this.lang === 'en'
+      this.rehearsal = this.lang === 'en'
         ? `${label}: step 42 exited with code 1 (rehearsal)`
         : `${label}：第 42 步 执行 ops_bash 时退出码 1（演练）`;
     }
@@ -377,10 +382,11 @@ export class PetModel {
       if (this.alert) {
         // 标题已经写了"任务已完成"这类结论，正文再重复一遍就是噪音；
         // 用你上次的请求补一句上下文更有用。
-        const title = this.alertTitle;
-        line1 = this.lastUser
-          ? (en ? `Your last request: “${this.lastUser}”` : `你上次的请求：「${this.lastUser}」`)
-          : title;
+        // 演练文案优先（它自带原因），否则用你上次的请求补上下文，别把标题重复一遍
+        line1 = this.rehearsal
+          || (this.lastUser
+            ? (en ? `Your last request: “${this.lastUser}”` : `你上次的请求：「${this.lastUser}」`)
+            : this.alertTitle);
       } else if (this.status === PetStatus.running) {
         line1 = entry.tool
           ? en ? `Running ${entry.tool}…` : `正在执行 ${entry.tool}`

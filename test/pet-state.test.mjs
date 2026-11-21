@@ -221,3 +221,18 @@ test('结束提醒的标题和正文不重复', () => {
   assert.notEqual(snap.line1, snap.alert.text, '正文不该把标题重复一遍');
   assert.match(snap.line1, /帮我把宠物插件装上/);
 });
+
+test('演练文案不会污染正在进行的对话气泡', () => {
+  const { model } = makeModel();
+  model.observeSession(root);
+  model.applyEvent({ ...root, event: { type: 'turn/start', data: { turn: 3 } } });
+  model.previewAlert('failed');
+  assert.match(model.snapshot().line1, /退出码 1（演练）/, '演练时正文要说明这是演练');
+  model.ack();
+  // 真实对话继续：新的 step 事件之后，气泡不该还停在演练的"退出码 1"上
+  model.applyEvent({ ...root, event: { type: 'step/start', data: { turn: 3, step: 4 } } });
+  model.applyEvent({ ...root, event: { type: 'assistant/message', data: { turn: 3, step: 4, message: { text: '已把 provider 路由改好' } } } });
+  const snap = model.snapshot();
+  assert.ok(!snap.line1.includes('退出码 1'), `气泡被演练文案污染了：${snap.line1}`);
+  assert.equal(snap.line1, '已把 provider 路由改好');
+});
