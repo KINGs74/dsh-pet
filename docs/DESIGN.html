@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSH 智能伙伴（dsh-pet）· 实现方案</title>
+<style>
+  :root{
+    --bg:#fbfbfd; --card:#ffffff; --ink:#16181d; --muted:#5c6270; --line:#e3e6ee;
+    --brand:#3b6cf6; --warm:#f0a35e; --ok:#2f9e64; --bad:#d4574a;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.75 -apple-system,"Segoe UI","Microsoft YaHei UI","PingFang SC",sans-serif;}
+  .wrap{max-width:1040px;margin:0 auto;padding:48px 28px 96px}
+  header.hero{border-bottom:1px solid var(--line);padding-bottom:28px;margin-bottom:36px}
+  .kicker{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--brand);font-weight:600}
+  h1{font-size:34px;line-height:1.28;margin:10px 0 12px}
+  .sub{color:var(--muted);font-size:16px;max-width:70ch}
+  h2{font-size:23px;margin:52px 0 14px;padding-top:8px}
+  h2 .num{color:var(--brand);font-variant-numeric:tabular-nums;margin-right:10px}
+  h3{font-size:17px;margin:26px 0 8px}
+  p{max-width:76ch}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:18px 0}
+  .grid{display:grid;gap:14px}
+  .grid.two{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+  table{border-collapse:collapse;width:100%;font-size:14.5px;margin:14px 0;background:var(--card)}
+  th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+  th{background:#f4f6fb;font-weight:600}
+  code{font-family:var(--mono);font-size:13.5px;background:#f1f3f9;border-radius:5px;padding:1px 5px}
+  pre{background:#12141a;color:#e6e9f2;padding:16px 18px;border-radius:12px;overflow:auto;font-size:13px;line-height:1.6}
+  pre code{background:none;padding:0;color:inherit}
+  .note{border-left:3px solid var(--brand);background:#f4f7ff;padding:12px 16px;border-radius:0 10px 10px 0;margin:16px 0}
+  .warn{border-left:3px solid var(--warm);background:#fff8f0}
+  .ok{color:var(--ok);font-weight:600} .bad{color:var(--bad);font-weight:600}
+  figure{margin:20px 0}
+  figure img{width:100%;border:1px solid var(--line);border-radius:12px;display:block}
+  figcaption{font-size:13px;color:var(--muted);margin-top:8px}
+  .flow{display:grid;gap:10px;margin:18px 0}
+  .box{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--card)}
+  .box b{display:block;font-size:14px;margin-bottom:4px}
+  .box span{font-size:13.5px;color:var(--muted)}
+  .arrow{text-align:center;color:var(--muted);font-size:13px;font-family:var(--mono)}
+  .pill{display:inline-block;font-size:12.5px;border:1px solid var(--line);border-radius:999px;padding:2px 10px;color:var(--muted);margin:0 6px 6px 0;background:#fff}
+  footer{margin-top:64px;border-top:1px solid var(--line);padding-top:18px;color:var(--muted);font-size:13.5px}
+  a{color:var(--brand)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="kicker">DSH Plugin · Design Note</div>
+  <h1>DSH 智能伙伴 <span style="color:var(--muted);font-weight:400">dsh-pet</span></h1>
+  <p class="sub">把 Codex 桌面的「迷你界面和智能伙伴」搬到 DeepSeek Harness：最小化也能看见对话进展，任务结束立刻知道，能用 petdex.dev 上的宠物，还能拖到屏幕任意位置。</p>
+  <div style="margin-top:14px">
+    <span class="pill">DSH 宿主插件</span><span class="pill">WinForms 分层窗口</span>
+    <span class="pill">petdex 兼容</span><span class="pill">24 条单测</span>
+  </div>
+</header>
+
+<h2><span class="num">01</span>先看 Codex 是怎么做的</h2>
+<p>Codex 与 Petdex Desktop 的思路可以拆成四件事，这也是本方案的参照系：</p>
+<div class="grid two">
+  <div class="card"><b>① 独立置顶透明窗体</b><div style="color:var(--muted);font-size:14.5px">无边框、<code>alwaysOnTop</code>、<code>transparent</code>，尺寸跟着精灵走、位置由用户拖动，因此不会被主面板布局裁剪。</div></div>
+  <div class="card"><b>② 精灵图集驱动动画</b><div style="color:var(--muted);font-size:14.5px">一张 <code>1536×1872</code>／<code>1536×2288</code> 的图，<code>8 列 × N 行</code>，每帧 <code>192×208</code>，一行一个状态，定时换帧。</div></div>
+  <div class="card"><b>③ 本地状态服务</b><div style="color:var(--muted);font-size:14.5px">Petdex Desktop 在 <code>127.0.0.1:7777</code> 起 hook 服务，<code>POST /state</code> 带 <code>X-Petdex-Update-Token</code>，宠物据此切行。</div></div>
+  <div class="card"><b>④ 气泡 + 系统通知</b><div style="color:var(--muted);font-size:14.5px">气泡说"正在做什么"，结束时切成明确的"任务已经结束"，配合声音与托盘气球，避免用户干等。</div></div>
+</div>
+
+<h2><span class="num">02</span>DSH 的硬约束，决定了架构</h2>
+<p>这些结论来自安装包 <code>app.asar</code> 与运行时探针，不是推测：</p>
+<table>
+  <tr><th style="width:38%">约束</th><th>证据 / 影响</th></tr>
+  <tr><td>Electron 主进程没有给插件窗口 API</td><td><code>lib/main.js</code> 中 <code>alwaysOnTop</code>、<code>transparent</code>、<code>setIgnoreMouseEvents</code> 出现 <b>0</b> 次；<code>setWindowOpenHandler</code> 8 处全部 <code>{action:'deny'}</code></td></tr>
+  <tr><td>DSH Host 是 <code>spawn</code> 出来的子 Node 进程</td><td>入口 <code>@deepseek-ai/dsh-desktop-host/lib/index.js</code>，<code>stdio: [ignore,pipe,pipe,ipc]</code>；宿主插件 <code>require('electron')</code> 必然失败</td></tr>
+  <tr><td>Host 服务目录没有 window / tray / screen</td><td><code>cordis_inspect_query</code> 全量枚举确认</td></tr>
+  <tr><td>客户端插槽救不了场</td><td><code>window.open</code> 被拒；<code>shell.overlay</code> 虽在 frame 之上，但仍在 DSH 窗口内——窗口最小化就一起消失，拖动也出不了窗口</td></tr>
+</table>
+<div class="note"><b>结论：</b>只要坚持"不可裁剪、最小化仍在、可拖全屏"，就必须拥有自己的 OS 窗口。于是采用「DSH 宿主插件 + 独立原生浮层进程」双体架构，两者用本机 HTTP 通信。</div>
+
+<h2><span class="num">03</span>总体架构</h2>
+<div class="flow">
+  <div class="box"><b>DSH 进程（Node）· dsh-pet 宿主插件</b><span>
+    订阅 <code>session/event</code> · <code>agent/status</code> → <code>PetModel</code> 纯函数状态机 ·
+    <code>ConfigStore</code> 原子写配置 · <code>PetHttpApi</code> 挂 <code>/x-dsh-pet/*</code> ·
+    <code>OverlaySupervisor</code> 编译／启动／看护／清理
+  </span></div>
+  <div class="arrow">▼ 本机 HTTP（127.0.0.1:14711，<code>X-Pet-Token</code>）　▲</div>
+  <div class="box"><b>PetOverlay.exe（独立进程，C#／WinForms／GDI+）</b><span>
+    400ms 轮询 <code>GET /state</code>（行协议）· 用户操作 <code>POST /config /ack /install</code> ·
+    分层窗口渲染 + 逐像素命中测试 · 托盘菜单
+  </span></div>
+</div>
+<p>为什么是 HTTP 轮询而不是 WebSocket / <code>@Remote</code> RPC：<code>webServer.register()</code> 是文档化能力；<code>@Remote</code> 在公开文档里没有第三方授权说明，不赌。400ms（忙碌）/1200ms（空闲）足够跟上"消息逐字追加"的观感，CPU 接近 0，实现简单、崩溃可自愈。所有接口强制 <code>X-Pet-Token</code>，token 每次启动随机生成，写在 <code>~/.dsh/pets/runtime.json</code>。</p>
+
+<h2><span class="num">04</span>渲染与拖拽层</h2>
+<p>浮层是 <code>WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE</code> 的无边框置顶窗口——不进 Alt+Tab、不抢焦点。</p>
+<table>
+  <tr><th style="width:26%">机制</th><th>做法</th></tr>
+  <tr><td>合成</td><td>内部一张 32bpp ARGB <code>Bitmap</code>，气泡、圆角、文字、精灵帧都先画在它上面</td></tr>
+  <tr><td>上屏</td><td>手工把 BGRA <b>直通 alpha 转预乘 alpha</b> 后拷进 DIB，再 <code>UpdateLayeredWindow(ULW_ALPHA)</code>。<b>不能用 <code>Graphics.FromHdc</code> 直接 DrawImage</b>——GDI+ 走 DIB 会丢逐像素 alpha</td></tr>
+  <tr><td>点击穿透</td><td>同一趟循环顺手缓存 alpha，<code>WM_NCHITTEST</code> 逐像素判断，透明处返回 <code>HTTRANSPARENT</code>：只有宠物和气泡吃鼠标</td></tr>
+  <tr><td>不抢焦点</td><td><code>WM_MOUSEACTIVATE</code> → <code>MA_NOACTIVATE</code>，点宠物不会把 DSH 顶到后面</td></tr>
+  <tr><td>拖动</td><td>4px 阈值后进入拖动，坐标夹取 <code>SystemInformation.VirtualScreen</code>（<b>虚拟屏幕</b>而非 DSH 窗口），可拖出窗口、跨显示器；松手持久化 <code>pos</code></td></tr>
+  <tr><td>DPI</td><td>manifest 声明 <code>PerMonitorV2</code>；行高用 <code>font.GetHeight(g)+1</code> 现算，150% 缩放不压字</td></tr>
+  <tr><td>锚点</td><td>以"宠物脚底中心"为锚：气泡长高时窗口向上扩、宠物不动；扩完 <code>ClampWindow()</code> 夹回当前显示器工作区</td></tr>
+</table>
+
+<figure>
+  <img src="img/04-dragged.png" alt="宠物被拖到桌面左下角，远超 DSH 窗口范围">
+  <figcaption>拖动验收：宠物与气泡被拖到桌面左下角，完全在 DSH 窗口之外，未被任何面板裁剪。</figcaption>
+</figure>
+
+<h2><span class="num">05</span>与对话流、任务结束的对接</h2>
+<p>宿主订阅的是 durable session 事件（<code>session/event</code>），这是 DSH 里最可靠的一层：</p>
+<table>
+  <tr><th style="width:34%">事件</th><th>用途</th></tr>
+  <tr><td><code>user/message</code></td><td>"你上次的请求"、标题推导、新一轮起点</td></tr>
+  <tr><td><code>assistant/message</code>（只取 <code>stream !== true</code>）</td><td>气泡正文 = 最新一条<b>正文</b>；reasoning 段被过滤，避免把模型思考漏到屏幕上</td></tr>
+  <tr><td><code>tool/call</code> · <code>tool/result</code></td><td>活动行"正在执行 X"、工具报错时的失败文案</td></tr>
+  <tr><td><code>turn/start</code></td><td>清掉上一轮结论，进入 running</td></tr>
+  <tr><td><code>turn/end</code></td><td><b>任务结束</b>：<code>reason.kind</code> 决定文案与成败配色，生成 <code>alert</code></td></tr>
+  <tr><td><code>step/start</code> · <code>step/end</code></td><td>页脚"第 N 步 · Ns"</td></tr>
+  <tr><td><code>agent/status</code></td><td>兜底：agent 空闲时状态回落</td></tr>
+</table>
+<div class="warn note" style="border-left-color:var(--bad);background:#fdf5f4">
+  <b>三个坑（都已处理）</b><br>
+  1. <code>turn/end</code> <b>不是</b> listener 事件，它是 <code>session/event</code> 的 payload，只能读 <code>event.type === 'turn/end'</code>。<br>
+  2. <code>approval/request</code> 是 <b>waterfall</b> 事件，监听器必须 <code>return next()</code>，否则审批面板会静默失踪；dsh-pet 因此不监听它，改用 <code>agent/status</code> + 会话事件推导 waiting。<br>
+  3. 只有 <b>根会话</b>结束才算任务结束（<code>session.header.parentSession</code> 为空），否则每个子 agent 转身都弹一次提醒。
+</div>
+
+<h2><span class="num">06</span>状态 ↔ 精灵行映射</h2>
+<table>
+  <tr><th>DSH 状态</th><th>含义</th><th>精灵行</th><th>帧数</th><th>fps</th></tr>
+  <tr><td><code>idle</code></td><td>没有进行中的任务</td><td>0 Idle</td><td>6</td><td>6</td></tr>
+  <tr><td><code>running</code></td><td>正在跑回合</td><td>7 Running</td><td>6</td><td>8</td></tr>
+  <tr><td><code>waiting</code></td><td>等你确认 / 回答</td><td>6 Waiting</td><td>6</td><td>5</td></tr>
+  <tr><td><code>failed</code></td><td>本轮失败 / 中断</td><td>5 Failed</td><td>8</td><td>8</td></tr>
+  <tr><td><code>done</code></td><td>完成但提醒未确认</td><td>8 Review</td><td>6</td><td>5</td></tr>
+  <tr><td>拖动中</td><td>跟随鼠标方向</td><td>1 RunRight / 2 RunLeft</td><td>8</td><td>14</td></tr>
+  <tr><td>新提醒 2.2s</td><td>庆祝跳跃</td><td>4 Jumping</td><td>5</td><td>8</td></tr>
+  <tr><td>有未确认提醒</td><td>招手等你</td><td>3 Waving</td><td>4</td><td>6</td></tr>
+</table>
+<p><code>SetRow()</code> 只在<b>行真的变化</b>时才重置帧号——早期版本每次轮询都归零，动画每 400ms 卡一下。</p>
+
+<h2><span class="num">07</span>petdex 宠物适配</h2>
+<p>宠物包 = <code>pet.json</code> + <code>spritesheet.webp</code>（或 <code>.png</code>）。校验：宽能被 8 整除、帧宽 ≥64、帧高 208、行数 ≥9；社区 v2 图集为 <code>1536×2288</code>（8×11）。</p>
+<p>素材获取走 petdex 自己的安装脚本——站点没有公开 JSON API（<code>/api/pets/*</code> 返回 401），这是最稳的接口：</p>
+<pre><code>GET https://petdex.dev/install/&lt;slug&gt;        → text/x-shellscript
+  curl -fsSL -e "https://petdex.dev/" -o "$PET_DIR/pet.json"        'https://assets.petdex.dev/.../petjson.json'
+  curl -fsSL -e "https://petdex.dev/" -o "$PET_DIR/spritesheet.webp" 'https://assets.petdex.dev/.../sprite.webp'</code></pre>
+<p>宿主用正则把它解析成「文件名 → URL」，自己带 <code>Referer: https://petdex.dev/</code> 下载（90s 超时、最多 24MB、重试 2 次）。</p>
+<div class="note"><b>关键坑：webp → PNG 会丢 alpha。</b>WIC 直接 <code>BitmapDecoder → PngBitmapEncoder</code> 得到 RGB 黑底，宠物画出来是个黑方块。必须在中间插一层 <code>FormatConvertedBitmap</code>，<code>DestinationFormat = Bgra32</code>，再编码——这是同一份"转换契约"，宿主与调试脚本都遵守。</div>
+<figure>
+  <img src="img/07-boba.png" alt="从 petdex 安装的 Boba 水豚">
+  <figcaption>从 petdex 一条链接安装的 <b>Boba</b>：<code>~/.dsh/pets/boba/spritesheet.png</code> 为 1536×2288 RGBA，安装即切换、无需重启。</figcaption>
+</figure>
+
+<h2><span class="num">08</span>提醒设计：让"结束"真的可见</h2>
+<p>同一个结束事件，走四路提示，任何一路都可能被用户忽略，四路一起才稳：</p>
+<div class="grid two">
+  <div class="card"><b>① 气泡变暖 + 明确文案</b><div style="color:var(--muted);font-size:14.5px">成功：<span class="ok">✔ 任务已完成，可以回来看了</span>（暖白底、琥珀描边）；失败：<span class="bad">✕ 任务执行失败，可以回来看原因了</span>（浅红底、砖红描边）。成败必须一眼可分——只改描边颜色不够。</div></div>
+  <div class="card"><b>② 动作切换</b><div style="color:var(--muted);font-size:14.5px">结束瞬间播 <code>Jumping</code> 庆祝 2.2s，随后成功播招手、失败播 <code>Failed</code> 行，直到你确认。</div></div>
+  <div class="card"><b>③ 声音</b><div style="color:var(--muted);font-size:14.5px">成功 <code>SystemSounds.Asterisk</code>、失败 <code>Hand</code>，可在托盘菜单关掉。</div></div>
+  <div class="card"><b>④ 系统托盘气球</b><div style="color:var(--muted);font-size:14.5px">Windows 通知，<b>点一下就确认</b>（<code>BalloonTipClicked → ack</code>），不必去点宠物。</div></div>
+</div>
+<figure>
+  <img src="img/13-alert-failed.png" alt="失败态提醒气泡">
+  <figcaption>失败态提醒：红色 ✕、浅红底、正文说明"第 42 步 执行 ops_bash 时退出码 1"，页脚保留轮次/耗时。</figcaption>
+</figure>
+
+<h2><span class="num">09</span>持久化与文件布局</h2>
+<table>
+  <tr><th style="width:40%">路径</th><th>内容</th></tr>
+  <tr><td><code>~/.dsh/pets/config.json</code></td><td><code>{pet, scale, bubble, sound, toast, lang, pos}</code>，tmp + rename 原子写、串行化</td></tr>
+  <tr><td><code>~/.dsh/pets/&lt;pet&gt;/</code></td><td><code>pet.json</code> + <code>spritesheet.webp</code> + 转换后的 <code>spritesheet.png</code></td></tr>
+  <tr><td><code>~/.dsh/pets/bin/PetOverlay.exe</code></td><td>首次运行用系统 <code>csc.exe</code> 编译，源码更新自动重编</td></tr>
+  <tr><td><code>~/.dsh/pets/runtime.json</code></td><td><code>{token, prefix, host}</code>：本机探针与浮层都用它，不写死路径</td></tr>
+  <tr><td><code>~/.dsh/pets/logs/</code></td><td><code>host.log</code>（宿主）+ <code>overlay.log</code>（浮层）</td></tr>
+</table>
+<p>位置以<b>物理像素</b>保存；重启、换宠物、换缩放都回到原位；「重置位置」回到<b>当前屏幕</b>右下角，而不是主屏。</p>
+<figure>
+  <img src="img/14-restart.png" alt="杀掉浮层后自动重启并恢复位置">
+  <figcaption>持久化验收：直接杀掉 <code>PetOverlay.exe</code>，宿主自动重启它，宠物、缩放与位置全部复原（同一坐标）。</figcaption>
+</figure>
+
+<h2><span class="num">10</span>可靠性设计与取舍</h2>
+<table>
+  <tr><th style="width:34%">问题</th><th>处理</th></tr>
+  <tr><td>单实例</td><td>浮层命名互斥量 <code>Local\DshPetOverlay.SingleInstance</code>；宿主启动前 <code>taskkill</code> 旧进程，避免"两个宠物"</td></tr>
+  <tr><td>编译失败</td><td>只写日志并把 <code>overlay</code> 标成 <code>unavailable</code>，DSH 照常工作</td></tr>
+  <tr><td>宿主挂了留孤儿</td><td>浮层连续 45s 拿不到状态即自行退出；宿主侧异常退出自动重启（≤5 次）</td></tr>
+  <tr><td>卸载不干净</td><td><code>ctx.effect</code> 清理函数逐个 <code>try/catch</code>（早期一个 TypeError 就会跳过路由注销，永久占住前缀）</td></tr>
+  <tr><td>热重载前缀残留</td><td>自动改用 <code>/x-dsh-pet-2</code>…，实际前缀写进 <code>runtime.json</code> 并通过 <code>--prefix</code> 传给浮层</td></tr>
+  <tr><td>非 Windows</td><td>插件加载后写一条日志即返回，不做任何事</td></tr>
+</table>
+<p><b>已知限制：</b>仅 Windows 提供浮层；气泡宽度固定 300px（可关）；混合 DPI 多屏切换位置可能偏一点（拖一下即可）；热重载后旧实例的前缀路由会残留，重启 DSH 即回到单一 <code>/x-dsh-pet</code>。</p>
+
+<h2><span class="num">11</span>验收对照</h2>
+<table>
+  <tr><th style="width:30%">验收标准</th><th>证据</th></tr>
+  <tr><td>最小化能看到对话内容</td><td><code>img/03-minimized.png</code>：DSH 窗口 <code>IsIconic=True</code>，宠物与气泡仍在桌面且内容持续更新</td></tr>
+  <tr><td>结束时有明确提示</td><td><code>img/02-alert.png</code>、<code>12-alert-success.png</code>、<code>13-alert-failed.png</code>；日志 <code>alert shown id=… kind=…</code></td></tr>
+  <tr><td>能加载 petdex 宠物</td><td><code>img/07-boba.png</code>；<code>boba/spritesheet.png</code> = 1536×2288 RGBA；日志 <code>已安装 Boba / 8 列 × 11 行 · 192×208</code></td></tr>
+  <tr><td>可拖到全屏任意位置</td><td><code>img/04-dragged.png</code>；<code>config.json</code> 记录 <code>pos</code>；日志 <code>mouse down … / drag to …</code></td></tr>
+  <tr><td>配置可保存并复现</td><td><code>img/14-restart.png</code>：杀掉浮层后自动重启，状态全部复原</td></tr>
+</table>
+<p>回归：<code>node --test test/</code> — 24 条用例，覆盖状态机、路由前缀、宠物解析与失败演练。</p>
+
+<footer>
+  dsh-pet · 交付物：<code>docs/DESIGN.md</code>（本文 Markdown 版）、<code>README.md</code>（安装/使用/验收）、<code>src/</code>（宿主插件）、<code>native/</code>（C# 浮层）、<code>test/</code>（回归）。
+</footer>
+</div>
+</body>
+</html>

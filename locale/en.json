@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Companion overlay",
+    "description": "A desktop pet that always stays on screen: shows the latest progress of the current conversation, alerts you the moment a task finishes, loads any pet from petdex.dev, and can be dragged anywhere on the screen."
+  }
+}

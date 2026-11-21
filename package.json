@@ -1,0 +1,41 @@
+{
+  "name": "dsh-pet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "跨窗口常驻的 DSH 桌宠：随时看到对话进展、任务结束立刻提醒，可加载 petdex.dev 上的宠物",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./locale/en.json": "./locale/en.json",
+    "./locale/zh.json": "./locale/zh.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "src",
+    "native",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "docs"
+  ],
+  "engines": {
+    "node": ">=22.6.0",
+    "dsh": ">=0.2.1-rc.3 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "dsh",
+    "pet",
+    "petdex",
+    "desktop-companion"
+  ]
+}

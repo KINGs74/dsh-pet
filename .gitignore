@@ -1,0 +1,6 @@
+node_modules/
+*.exe
+*.log
+check.exe
+.DS_Store
+Thumbs.db

@@ -1,0 +1,7 @@
+# dsh-pet —— 把一只常驻桌宠挂到 DSH 上。
+#
+# 只有宿主插件：渲染与拖拽在独立的原生浮层进程里完成（见 native/PetOverlay.cs），
+# 因此不需要客户端 bundle，也不会被 agent 面板裁剪。
+- insert:
+    - id: dsh-pet
+      name: dsh-pet
