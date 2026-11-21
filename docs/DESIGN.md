@@ -153,10 +153,10 @@ $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder; $enc.Save(...)
 
 ## 8. 配置持久化
 
-- `~/.dsh/pets/config.json`：`{pet, scale, bubble, sound, toast, lang, pos}`，tmp + rename 原子写，串行化避免并发写坏。
+- `~/.dsh/pets/config.json`：`{pet, scale, bubble, sound, bubbleMs, alertMs, lang, pos}`，tmp + rename 原子写，串行化避免并发写坏。
 - `~/.dsh/pets/<pet>/{pet.json, spritesheet.png, spritesheet.webp}`。
 - `~/.dsh/pets/bin/PetOverlay.exe`、`~/.dsh/pets/logs/host.log`、`~/.dsh/pets/logs/overlay.log`、`~/.dsh/pets/runtime.json`（token + 前缀）。
-- 浮层位置以**物理像素**存，重启/换宠物/换缩放都回到原位；「重置位置」回到**当前屏幕**右下角，不是主屏。
+- 浮层位置以**物理像素**存成「底边中点」锚点（宠物变大、气泡出现时锚点不动，窗口只向上长），重启/换宠物/换缩放都回到原位；0.2 起取消了「重置位置」，想去哪儿拖到哪儿。
 
 ---
 
@@ -192,3 +192,116 @@ $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder; $enc.Save(...)
 | 配置可保存并复现 | `14-restart.png`：杀掉浮层后宿主自动重启，宠物、缩放、位置全部复原 |
 
 回归：`node --test test/`（24 条用例，覆盖状态机、路由、宠物解析）。
+---
+
+## 11. 第二轮：交互、生命周期与那三个 bug（0.2.0）
+
+这一轮把「像 Codex 那样用」补齐，也修掉了第一轮遗留的三个真 bug。下面按需求逐条给结论。
+
+### 11.1 退出 DSH 时宠物会不会跟着消失？——不会，这是个 bug，已修
+
+第一轮只靠「连续 45 秒拿不到状态就自己退出」看门，宿主退出后宠物会**在屏幕上干站 45 秒**。
+
+修法：宿主把自己的 pid 与 exe 路径交给浮层（`--dsh-pid` = `process.ppid`，`--dsh-exe` = `process.execPath`），
+浮层轮询里先 `OpenProcess(pid)` + `GetExitCodeProcess` 判断 `STILL_ACTIVE`，宿主一没就 `CloseFromThread()`。
+实测 `PetOverlay.exe --dsh-pid 999999` → 0.22 秒后日志 `DSH 已退出，浮层退出`，退出码 0。
+
+反过来，**DSH 关窗口 ≠ 退出**：Electron 主进程里点关闭走的是 `mainWindow.hide()`（只有 `isQuitting()` 才 `close()`），
+所以窗口隐藏后宠物必须留着——这条顺带解释了 11.3 的根因。
+
+### 11.2 能不能不要托盘图标？——能，已去掉
+
+托盘原本只承担三件事，都有替代：
+
+| 托盘职责 | 替代 |
+| --- | --- |
+| 系统气球通知 | 浮层自己的暖色气泡（`✔ 任务已经结束`）+ 提示音 + 宠物跳跃/招手 |
+| 菜单入口 | 宠物右键菜单（同一份 `BuildMenuEntries`） |
+| 退出入口 | 菜单最后一项「退出宠物窗」 |
+
+于是 `NotifyIcon` 相关代码整体删除（`grep -c NotifyIcon native/*.cs` = 0），`notify/toast` 配置项一并退役。
+
+### 11.3 「打开 DSH」有时没反应——是真 bug，两个根因叠加
+
+| 根因 | 细节 | 修法 |
+| --- | --- | --- |
+| 只认可见窗口 | 旧 `FocusDsh()` 在 `EnumWindows` 回调里 `if (!IsWindowVisible(h)) return;`；而 DSH 点关闭是 **hide 到后台**，窗口从此不可见 → 永远走「找不到窗口」分支 | 按 pid 找窗口、**不看可见性**，用打分选主窗口（有标题 +10、可见 +5、非最小化 +2） |
+| 抢前台被系统拒绝 | 浮层是 `WS_EX_NOACTIVATE` 工具窗，从不拥有前台，`SetForegroundWindow` 被 Windows 静默拒绝；旧代码**没检查返回值**，日志照样打「focused」 | 先 `ShowWindow(SW_SHOW/SW_RESTORE/SW_SHOWNORMAL)`，再 `AttachThreadInput` 借前台线程输入队列，`SetForegroundWindow` 重试 3 次并**校验 `GetForegroundWindow()==hWnd`** |
+| 兜底 | 主窗口真被销毁（崩溃/重启）时无处可聚焦 | `Process.Start(dshExe)` → Electron 的 `second-instance` 回调会 `restore/show/focus` 主窗口 |
+
+实测：正常、最小化（`IsIconic=True`）、`ShowWindow(SW_HIDE)` 隐藏三态下，单击宠物都能把 DSH 拉到前台，
+日志 `focused DSH window (click) hwnd=…`，`GetForegroundWindow()` 确认就是 DSH 主窗口。
+
+### 11.4 点击宠物直接打开 DSH
+
+`WM_LBUTTONUP` 且没有拖动时：先 `PostAck()`（有提醒就当成「我知道了」），再 `FocusDsh("click")`。
+单击不再用于展开/收起气泡——气泡按时间自动收起（11.7），菜单里的开关才管显示/隐藏。
+
+### 11.5 就地写字 / 语音 / 鼠标离开收起
+
+- **悬停**：`_hoverTimer`（120ms）在指针进入窗口矩形时置 `_hover`，窗口顶部浮出 78×34 胶囊工具条（✎ / 🎤）；
+  指针离开 300ms 收起（`HoverVisible = _hover || IsComposing`）。
+- **✎ 写字**：`ComposeWindow` 贴在宠物上方的圆角输入框（宠物贴屏幕顶时自动翻到下方），
+  Enter 发送 / Shift+Enter 换行 / Esc 关闭 / 失焦且为空自动关。发送走 `POST /say`，宿主用
+  `sessionController.prompt({requestId, sessionId, mode:'queue', content:[{type:'text', text}]}, AbortSignal.timeout(15s))`
+  把这句**作为一条用户消息**投进当前会话——和你在输入框里打字是同一条链路，不是旁路注入。
+- **🎤 语音**：`SpeechRecognitionEngine` + `DictationGrammar`（本机两个引擎，优先中文）。
+  `Hypothesized` 把草稿灰字实时填进输入框，`Recognized` 定稿，停 3 秒自动停。
+  编译期用 `#define:VOICE` + GAC 的 `System.Speech.dll`；找不到就退化成「这台机器没有可用的语音识别引擎」，
+  不会让整个浮层编译失败。
+
+### 11.6 右键菜单：自绘圆角半透明
+
+不用系统 `ContextMenuStrip`（方角、灰底、没有真悬停态）。`OverlayMenu` 是一个**分层窗口**自己画：
+
+- 主列 + 子菜单是**同一个窗口的两列**（子菜单开成子窗口的话，父窗口一失活菜单就关）；
+- 底色高不透明度 + 1px 描边 + 三层递减阴影，深浅色跟随
+  `HKCU\…\Themes\Personalize\AppsUseLightTheme`；
+- 子菜单靠近屏幕右缘时**整体翻到主列左侧**（`_contentShift` 平移，窗口左边界反向抵消）；
+- 悬停高亮用 90ms 定时器**轮询**光标位置——置顶无激活窗口不一定收得到 `WM_MOUSEMOVE`，
+  纯事件驱动会出现「鼠标停在子菜单项上却不展开」；
+- Esc 逐级关闭、失焦 140ms 后关，真 `✓`/`▸` 字形而非文字符号。
+
+> 调试记录：翻到左侧后主列文字整段消失，根因是 `DrawString` 的矩形宽度写成 `rect.Width - textLeft`，
+> 而 `textLeft` 是**绝对坐标**，`_contentShift` 一大宽度就变负数。改成 `rect.Right - textLeft` 后正常。
+
+### 11.7 气泡停留时长可设置
+
+`bubbleMs`（默认 5000，菜单里 3 / 5 / 8 秒 / 一直显示 / 关闭气泡）、`alertMs`（默认 30000，结束提醒更久）。
+两个值宿主下发、浮层执行；`bubbleMs = 0` 表示常显。
+
+内容「变没变」用指纹判断，指纹里**剔掉了 `第 N 步 · 45s` 那个每秒跳动的计时**（`StripElapsed`），
+否则计时一刷新就把气泡重新点亮、永远收不起来。
+
+### 11.8 位置持久（并去掉「重置位置」）
+
+松手 → `POST /config {pos:1, posx, posy}` → 写 `config.json`；启动时用保存的锚点还原，
+窗口尺寸变化按「底边中点」重新摆位，再用 `Screen.FromPoint(...).WorkingArea` 夹回可见区；
+`WM_DPICHANGED` / `WM_DISPLAYCHANGE` 触发重新布局与夹取，插拔显示器不会把宠物丢到屏幕外。
+
+### 11.9 顺手补的（原 UX 评审里未落地的 P1）
+
+| 项 | 说明 |
+| --- | --- |
+| 深色主题 | 菜单、气泡、工具条按系统深浅色切换调色板 |
+| 错误可见 | 编译失败 / 网络失败 / 发送失败以红字写进气泡或输入框，不再只进日志 |
+| 结束时长提示 | `alert.age`：提醒超过 1 分钟，正文追加「N 分钟前结束」 |
+| `/pet` 补全 | 新增 `bubble <秒>`、`say <内容>`、`test failed` |
+| 中文换行 | 正文按 CJK 逐字断行（旧版按空格切，中文整段溢出成一行省略号） |
+| 断开可见 | 宿主失联 4 次后气泡写 `DSH 已断开，重连中…`，不再拿旧进度装没事 |
+| 图标重绘 | 蓝色徽章 + 对话气泡脸，`tools/make-icon.py` 出多尺寸 `app.ico` |
+
+### 11.10 这一轮的验收
+
+| 需求 | 结论 / 证据 |
+| --- | --- |
+| 宠物随 DSH 生死 | `--dsh-pid 999999` → 0.22s 退出并记 `DSH 已退出，浮层退出`；重新启用插件自动重启并回到原位置（`22-restored-0.2.png`） |
+| 去托盘图标 | `NotifyIcon` 计数 0，通知区无残留 |
+| 「打开 DSH」bug | 两处根因定位并修复；正常 / 最小化 / 隐藏三态实测均能拉起 |
+| 点击宠物打开 DSH | 同上，单击即拉起 |
+| 就地写字 | `overlay.log` `say result: 已发送`，宿主日志 `浮层消息 → <sessionId>：…` |
+| 语音 | SAPI 两个引擎可用，`#if VOICE` 编译通过；无引擎时降级提示 |
+| 菜单美化 | `20-menu-0.2.png`：圆角半透明、真 ✓、子菜单左翻 |
+| 气泡时长 | `bubbleMs=1000` 时 4 秒后气泡与工具条消失、宠物留在原地 |
+| 位置持久 | 拖到左下后写 `pos`，禁用→启用后原位复原（`22-restored-0.2.png`） |
+| 最小化仍可用 | `23-minimized-alert-0.2.png`：`IsIconic=True` 时宠物与失败提醒气泡都在桌面 |

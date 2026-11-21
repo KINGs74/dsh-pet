@@ -16,7 +16,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   scale: 0.55, // 宠物缩放，0.3 ~ 1.5
   bubble: true, // 是否显示气泡
   sound: true, // 任务结束提示音
-  toast: true, // 任务结束系统通知
+  bubbleMs: 5000, // 气泡停留毫秒；0 = 一直显示（未确认的结束提醒另外算 alertMs）
+  alertMs: 30000, // 结束提醒至少停留多久（毫秒）
   lang: 'zh', // 气泡文案语言：zh | en
   pos: null, // 宠物锚点（屏幕物理像素）{x, y}
 });
@@ -49,7 +50,8 @@ export function normalizeConfig(raw) {
     scale: clampNumber(input.scale, SCALE_MIN, SCALE_MAX, DEFAULT_CONFIG.scale),
     bubble: toBool(input.bubble, DEFAULT_CONFIG.bubble),
     sound: toBool(input.sound, DEFAULT_CONFIG.sound),
-    toast: toBool(input.toast, DEFAULT_CONFIG.toast),
+    bubbleMs: clampNumber(input.bubbleMs, 0, 600000, DEFAULT_CONFIG.bubbleMs),
+    alertMs: clampNumber(input.alertMs, 0, 600000, DEFAULT_CONFIG.alertMs),
     lang: input.lang === 'en' ? 'en' : 'zh',
     pos,
   };

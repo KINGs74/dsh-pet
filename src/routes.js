@@ -73,6 +73,7 @@ export function serializeState(snapshot) {
     put('alert.id', snapshot.alert.id);
     put('alert.kind', snapshot.alert.kind);
     put('alert.text', snapshot.alert.text);
+    put('alert.age', snapshot.alertAge);
   }
   put('pet.id', snapshot.pet?.id);
   put('pet.name', snapshot.pet?.name);
@@ -84,10 +85,14 @@ export function serializeState(snapshot) {
   put('scale', snapshot.scale);
   put('bubble', snapshot.bubble ? '1' : '0');
   put('sound', snapshot.sound ? '1' : '0');
-  put('notify', snapshot.toast ? '1' : '0');
+  put('bubbleMs', snapshot.bubbleMs);
+  put('alertMs', snapshot.alertMs);
   put('lang', snapshot.lang);
   put('toast', snapshot.toastText);
   put('overlay', snapshot.overlay);
+  // 浮层据此判断「DSH 还在不在」：主进程活着就继续显示，死了就自己退出
+  put('dsh.pid', snapshot.dshPid);
+  put('dsh.exe', snapshot.dshExe);
   if (snapshot.pos) {
     put('pos.x', snapshot.pos.x);
     put('pos.y', snapshot.pos.y);
@@ -164,6 +169,12 @@ export class PetHttpApi {
         const body = parseBody(await readBody(req), req.headers['content-type'] ?? '');
         this.service.overlayEvent(body);
         send(res, 200, 'ok');
+        return;
+      }
+      if (req.method === 'POST' && endpoint === 'say') {
+        const body = parseBody(await readBody(req), req.headers['content-type'] ?? '');
+        const result = await this.service.say(String(body.text ?? ''));
+        send(res, 200, result);
         return;
       }
       if (req.method === 'POST' && endpoint === 'test') {

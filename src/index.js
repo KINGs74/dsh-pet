@@ -45,6 +45,10 @@ function createLogger() {
   };
 }
 
+function config_lang(lang) {
+  return lang === 'en' ? 'en' : 'zh';
+}
+
 function asBool(value, fallback) {
   if (value === undefined || value === null || value === '') return fallback;
   if (typeof value === 'boolean') return value;
@@ -64,6 +68,9 @@ class PetService {
     this.toastText = '';
     this.toastAt = 0;
     this.supervisor = null;
+    this.sessionController = null;
+    this._alertSince = 0;
+    this._alertIdSeen = '';
   }
 
   async refreshPets() {
@@ -97,12 +104,62 @@ class PetService {
       scale: config.scale,
       bubble: config.bubble,
       sound: config.sound,
-      toast: config.toast,
+      bubbleMs: config.bubbleMs,
+      alertMs: config.alertMs,
       lang: config.lang,
       toastText: toastAlive ? this.toastText : '',
       overlay: this.supervisor?.status().state ?? 'stopped',
       pos: config.pos,
+      dshPid: process.ppid,
+      dshExe: process.execPath,
+      alertAge: this.alertAge(snapshot),
     };
+  }
+
+  /** 结束提醒从第一次被看到算起，给气泡一个「多久之前」的说法 */
+  alertAge(snapshot) {
+    const id = snapshot?.alert?.id ?? '';
+    if (!id) {
+      this._alertIdSeen = '';
+      this._alertSince = 0;
+      return '';
+    }
+    if (id !== this._alertIdSeen) {
+      this._alertIdSeen = id;
+      this._alertSince = Date.now();
+      return '';
+    }
+    const age = Date.now() - this._alertSince;
+    if (age < 60_000) return '';
+    const minutes = Math.round(age / 60_000);
+    return config_lang(this.store.get().lang) === 'en' ? `${minutes} min ago` : `${minutes} 分钟前结束`;
+  }
+
+  /** 从浮层发一条消息进当前会话（复用 sessionController.prompt，等价于用户在输入框里敲） */
+  async say(text) {
+    const content = String(text ?? '').trim();
+    if (!content) return '失败：消息是空的';
+    const snapshot = this.model.snapshot();
+    const sessionId = snapshot?.sessionId;
+    if (!sessionId) return '失败：还没有进行中的对话，先在 DSH 里开一个会话';
+    const controller = this.sessionController;
+    if (!controller || typeof controller.prompt !== 'function') {
+      return '失败：当前 DSH 版本没有开放 sessionController，无法从浮层发消息';
+    }
+    try {
+      const requestId = `pet-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      await controller.prompt(
+        { requestId, sessionId, mode: 'queue', content: [{ type: 'text', text: content }] },
+        AbortSignal.timeout(15_000),
+      );
+      this.setToast('已发送');
+      this.log(`浮层消息 → ${sessionId}：${excerpt(content, 40)}`);
+      return '已发送';
+    } catch (error) {
+      const message = error?.message ?? String(error);
+      this.log(`浮层消息失败：${message}`);
+      return `失败：${message}`;
+    }
   }
 
   ack(alertId) {
@@ -133,10 +190,13 @@ class PetService {
     const config = this.store.get();
     if (body.bubble !== undefined) patch.bubble = asBool(body.bubble, config.bubble);
     if (body.sound !== undefined) patch.sound = asBool(body.sound, config.sound);
-    if (body.notify !== undefined) patch.toast = asBool(body.notify, config.toast);
-    if (body.toast !== undefined && body.pos === undefined) {
-      // 兼容旧字段名：toast 在这里表示"结束气泡提醒"开关
-      if (body.toast === '0' || body.toast === '1') patch.toast = asBool(body.toast, config.toast);
+    if (body.bubbleMs !== undefined && body.bubbleMs !== '') {
+      const raw = Number(body.bubbleMs);
+      if (Number.isFinite(raw) && raw >= 0) patch.bubbleMs = Math.round(raw);
+    }
+    if (body.alertMs !== undefined && body.alertMs !== '') {
+      const raw = Number(body.alertMs);
+      if (Number.isFinite(raw) && raw >= 0) patch.alertMs = Math.round(raw);
     }
     if (body.lang !== undefined && body.lang) patch.lang = String(body.lang);
     if (String(body.pos ?? '') === '1') {
@@ -253,6 +313,13 @@ export function apply(ctx, pluginConfig = {}) {
     service.prefix = prefix;
     log(`已挂载 ${prefix}/* 到 ${safeOrigin(ctx)}`);
 
+    // 浮层里的「✎ 写一句话」最终落到 sessionController.prompt，
+    // 效果和用户在输入框里敲一条消息一样。老版本 DSH 没有这个服务时降级为不可用。
+    const offController = ctx.inject(['sessionController'], (scope) => {
+      service.sessionController = scope.sessionController;
+      log('已接上 sessionController（浮层可以直接发消息）');
+    });
+
     const tick = setInterval(() => {
       service.refreshPets().catch(() => {});
     }, 15_000);
@@ -315,7 +382,7 @@ export function apply(ctx, pluginConfig = {}) {
       return scope.commands.register({
         name: 'pet',
         description: '智能伙伴浮层：查看状态 / 切换宠物 / 安装 petdex 宠物',
-        input: { hint: 'status | pets | pet <名称> | scale <40-125> | install <petdex 名称或链接> | test' },
+        input: { hint: 'status | pets | pet <名称> | scale <40-125> | bubble <秒> | say <内容> | install <petdex 名称或链接> | test' },
         handler: async (invocation) => {
           try {
             const [verb = 'status', ...rest] = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean);
@@ -339,7 +406,7 @@ export function apply(ctx, pluginConfig = {}) {
         return [
           `浮层：${overlay}`,
           `宠物：${petName}${st.pet ? `（${st.pet.id}）` : ''}`,
-          `气泡：${config.bubble ? '开' : '关'} · 提示音：${config.sound ? '开' : '关'} · 系统通知：${config.toast ? '开' : '关'}`,
+          `气泡：${config.bubble ? '开' : '关'}（${config.bubbleMs === 0 ? '一直显示' : `${Math.round(config.bubbleMs / 1000)} 秒`}）· 提示音：${config.sound ? '开' : '关'}`,
           `缩放：${Math.round(config.scale * 100)}%`,
           `已装宠物：${st.pets.length} 只`,
           st.alert ? `待确认提醒：${st.alert.text}` : '没有待确认的提醒',
@@ -369,15 +436,26 @@ export function apply(ctx, pluginConfig = {}) {
         return await service.install(arg);
       }
       if (verb === 'test') {
-        service.test();
+        service.test(arg === 'failed' ? 'failed' : 'completed');
         return '已触发一次"任务结束"演练，看看浮层上的提醒';
       }
-      if (verb === 'sound' || verb === 'bubble' || verb === 'toast') {
-        const on = arg !== 'off' && arg !== '0' && arg !== 'false';
-        await service.configure({ [verb]: on ? '1' : '0' });
-        return `${verb} 已${on ? '开启' : '关闭'}`;
+      if (verb === 'bubble') {
+        if (!arg) return `气泡停留 ${Math.round(config.bubbleMs / 1000)} 秒（0 = 一直显示）`;
+        const seconds = Number(arg);
+        if (!Number.isFinite(seconds) || seconds < 0 || seconds > 600) throw new Error('用法：/pet bubble 3（秒，0 = 一直显示）');
+        await service.configure({ bubbleMs: String(Math.round(seconds * 1000)) });
+        return seconds === 0 ? '气泡改为一直显示' : `气泡改为停留 ${Math.round(seconds)} 秒`;
       }
-      throw new Error(`未知子命令 ${verb}，可用：status / pets / pet / scale / install / test / sound / bubble / toast`);
+      if (verb === 'say') {
+        if (!arg) throw new Error('用法：/pet say 你好');
+        return await service.say(arg);
+      }
+      if (verb === 'sound') {
+        const on = arg !== 'off' && arg !== '0' && arg !== 'false';
+        await service.configure({ sound: on ? '1' : '0' });
+        return `提示音已${on ? '开启' : '关闭'}`;
+      }
+      throw new Error(`未知子命令 ${verb}，可用：status / pets / pet / scale / bubble / say / install / test / sound`);
     };
 
     let supervisor = null;
@@ -389,8 +467,7 @@ export function apply(ctx, pluginConfig = {}) {
         const config = store.get();
         if (config.pet) model.setLang?.(config.lang);
 
-        const csPath = join(pluginDir, 'native', 'PetOverlay.cs');
-        const manifestPath = join(pluginDir, 'native', 'app.manifest');
+        const nativeDir = join(pluginDir, 'native');
         const exePath = join(PETS_ROOT, 'bin', 'PetOverlay.exe');
 
         await service.refreshPets().catch(() => {});
@@ -401,7 +478,7 @@ export function apply(ctx, pluginConfig = {}) {
             .then((message) => log(`默认宠物：${message}`))
             .catch(() => {});
         }
-        const build = await buildOverlay({ csPath, manifestPath, exePath, log });
+        const build = await buildOverlay({ nativeDir, exePath, log });
         if (!build.ok) log(`浮层不可用：${build.message}`);
 
         supervisor = new OverlaySupervisor({
@@ -409,6 +486,8 @@ export function apply(ctx, pluginConfig = {}) {
           host: safeOrigin(ctx),
           token,
           prefix,
+          dshPid: process.ppid,
+          dshExe: process.execPath,
           logFile: OVERLAY_LOG,
           log,
         });
@@ -419,6 +498,8 @@ export function apply(ctx, pluginConfig = {}) {
           prefix,
           host: safeOrigin(ctx),
           hostPid: process.pid,
+          dshPid: process.ppid,
+          dshExe: process.execPath,
           startedAt: new Date().toISOString(),
         }).catch(() => {});
 
@@ -455,6 +536,7 @@ export function apply(ctx, pluginConfig = {}) {
       dispose(offApproval, 'approval/request');
       dispose(offQuestions, 'user-questions/request');
       dispose(offCommand, '/pet 命令');
+      dispose(offController, 'sessionController');
       try {
         await supervisor?.stop();
       } catch {}

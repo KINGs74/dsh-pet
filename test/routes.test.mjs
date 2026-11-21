@@ -34,11 +34,15 @@ test('状态行协议包含浮层需要的全部字段', () => {
     scale: 0.55,
     bubble: true,
     sound: false,
-    toast: true,
+    bubbleMs: 5000,
+    alertMs: 30000,
+    alertAge: '3 分钟前结束',
     lang: 'zh',
     toastText: '已切换到 Boba',
     overlay: 'running',
     pos: { x: 1200, y: 640 },
+    dshPid: 31144,
+    dshExe: 'C:\\Program Files\\DSH\\DeepSeek Harness.exe',
   });
 
   const map = toMap(text);
@@ -52,7 +56,10 @@ test('状态行协议包含浮层需要的全部字段', () => {
   assert.equal(map.get('scale'), '0.55');
   assert.equal(map.get('bubble'), '1');
   assert.equal(map.get('sound'), '0');
-  assert.equal(map.get('notify'), '1');
+  assert.equal(map.get('bubbleMs'), '5000');
+  assert.equal(map.get('alertMs'), '30000');
+  assert.equal(map.get('alert.age'), '3 分钟前结束');
+  assert.equal(map.get('dsh.pid'), '31144');
   assert.equal(map.get('toast'), '已切换到 Boba');
   assert.equal(map.get('pos.x'), '1200');
   assert.equal(map.get('petlist.0.id'), 'boba');

@@ -7,7 +7,7 @@
 // 顶层窗口实现。这里用 .NET Framework 自带的 csc.exe 现场编译一个几百行的
 // WinForms 分层窗口，不需要用户装编译环境。
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const CSC_PATHS = [
@@ -22,6 +22,26 @@ async function fileExists(path) {
   } catch {
     return false;
   }
+}
+
+// System.Speech 只在 GAC 里，csc 需要完整路径才能引用；找不到就编译无语音版本
+const SPEECH_GAC_ROOTS = [
+  'C:/Windows/Microsoft.NET/assembly/GAC_MSIL/System.Speech',
+  'C:/Windows/assembly/GAC_MSIL/System.Speech',
+];
+
+export async function findSpeechDll() {
+  if (process.platform !== 'win32') return '';
+  for (const root of SPEECH_GAC_ROOTS) {
+    try {
+      const versions = await readdir(root);
+      for (const version of versions) {
+        const candidate = join(root, version, 'System.Speech.dll');
+        if (await fileExists(candidate)) return candidate;
+      }
+    } catch {}
+  }
+  return '';
 }
 
 export async function findCsc() {
@@ -62,10 +82,10 @@ export function run(cmd, args, { timeoutMs = 120_000, cwd } = {}) {
 }
 
 /** 源码比 exe 新（或 exe 缺失）时才重新编译 */
-export async function needsBuild({ csPath, manifestPath, exePath }) {
+export async function needsBuild({ sources, exePath }) {
   if (!(await fileExists(exePath))) return { needed: true, reason: '缺少可执行文件' };
   const exeInfo = await stat(exePath);
-  for (const source of [csPath, manifestPath]) {
+  for (const source of sources) {
     if (!(await fileExists(source))) return { needed: false, reason: `源码缺失：${source}`, missing: true };
     const info = await stat(source);
     if (info.mtimeMs > exeInfo.mtimeMs + 1000) return { needed: true, reason: '源码已更新' };
@@ -73,19 +93,48 @@ export async function needsBuild({ csPath, manifestPath, exePath }) {
   return { needed: false, reason: '已是最新' };
 }
 
+/** 枚举 native/ 下的全部 .cs（含 manifest 与图标），返回值参与 mtime 比较 */
+export async function collectSources(nativeDir) {
+  const sources = [];
+  try {
+    const files = await readdir(nativeDir);
+    for (const file of files.sort()) {
+      // 只有 .cs 是编译输入；manifest / 图标是资源，只参与"要不要重编"的比较
+      if (file.endsWith('.cs')) sources.push(join(nativeDir, file));
+    }
+  } catch {
+    return { sources: [], manifestPath: '', iconPath: '', error: `无法读取 ${nativeDir}` };
+  }
+  const iconPath = join(nativeDir, 'app.ico');
+  const hasIcon = await fileExists(iconPath);
+  return {
+    sources,
+    manifestPath: join(nativeDir, 'app.manifest'),
+    iconPath: hasIcon ? iconPath : '',
+    error: '',
+  };
+}
+
 /**
  * 编译原生浮层。失败不抛异常：返回 { ok:false, message }，由调用方把
  * overlay=unavailable 发给浮层/日志，绝不影响 DSH 本体。
  */
-export async function buildOverlay({ csPath, manifestPath, exePath, log = () => {}, force = false }) {
+export async function buildOverlay({ nativeDir, exePath, log = () => {}, force = false }) {
   const csc = await findCsc();
   if (!csc) return { ok: false, message: '找不到 csc.exe（需要 .NET Framework 4.x）' };
-  const check = await needsBuild({ csPath, manifestPath, exePath });
+  const collected = await collectSources(nativeDir);
+  if (collected.error) return { ok: false, message: collected.error };
+  if (collected.sources.length === 0) return { ok: false, message: `native 目录里没有源码：${nativeDir}` };
+  const watched = [...collected.sources];
+  if (collected.manifestPath) watched.push(collected.manifestPath);
+  if (collected.iconPath) watched.push(collected.iconPath);
+  const check = await needsBuild({ sources: watched, exePath });
   if (check.missing) return { ok: false, message: check.reason };
   if (!check.needed && !force) return { ok: true, message: '已是最新' };
 
-  await mkdir(join(exePath, '..'), { recursive: true });
-  const result = await run(csc, [
+  const manifestPath = collected.manifestPath;
+  const speechDll = await findSpeechDll();
+  const args = [
     '/nologo',
     '/target:winexe',
     '/optimize+',
@@ -94,8 +143,17 @@ export async function buildOverlay({ csPath, manifestPath, exePath, log = () => 
     '/r:System.dll',
     '/r:System.Drawing.dll',
     '/r:System.Windows.Forms.dll',
-    csPath,
-  ]);
+  ];
+  if (speechDll) {
+    args.push(`/r:${speechDll}`, '/define:VOICE');
+  } else {
+    log('没有找到 System.Speech.dll，浮层将以无语音模式编译');
+  }
+  if (collected.iconPath) args.push(`/win32icon:${collected.iconPath}`);
+  for (const source of collected.sources) args.push(source);
+
+  await mkdir(join(exePath, '..'), { recursive: true });
+  const result = await run(csc, args);
   if (!result.ok) {
     const message = `编译失败：${(result.err || result.out || '').trim().split('\n').slice(0, 4).join(' ')}`;
     log(message);
@@ -109,11 +167,14 @@ export async function buildOverlay({ csPath, manifestPath, exePath, log = () => 
  * 浮层进程监护：启动、退出后自动重启（有上限）、随插件卸载一起清理。
  */
 export class OverlaySupervisor {
-  constructor({ exePath, host, token, prefix = '/x-dsh-pet', logFile, log = () => {}, maxRestarts = 5 }) {
+  constructor({ exePath, host, token, prefix = '/x-dsh-pet', dshPid = 0, dshExe = '', logFile, log = () => {}, maxRestarts = 5 }) {
     this.exePath = exePath;
     this.host = host;
     this.token = token;
     this.prefix = prefix;
+    // 浮层靠这两个值判断「DSH 是否还活着」：主进程没了就自己退出，不留下孤儿窗口
+    this.dshPid = dshPid;
+    this.dshExe = dshExe;
     this.logFile = logFile;
     this.log = log;
     this.maxRestarts = maxRestarts;
@@ -144,7 +205,10 @@ export class OverlaySupervisor {
     }
     await mkdir(join(this.logFile, '..'), { recursive: true });
     this.state = 'starting';
-    const child = spawn(this.exePath, ['--host', this.host, '--token', this.token, '--log', this.logFile, '--prefix', this.prefix], {
+    const args = ['--host', this.host, '--token', this.token, '--log', this.logFile, '--prefix', this.prefix];
+    if (this.dshPid) args.push('--dsh-pid', String(this.dshPid));
+    if (this.dshExe) args.push('--dsh-exe', this.dshExe);
+    const child = spawn(this.exePath, args, {
       windowsHide: false,
       stdio: 'ignore',
       detached: false,

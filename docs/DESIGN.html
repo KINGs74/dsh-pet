@@ -210,6 +210,87 @@
 </table>
 <p>回归：<code>node --test test/</code> — 24 条用例，覆盖状态机、路由前缀、宠物解析与失败演练。</p>
 
+<h2><span class="num">12</span>第二轮改动：交互、生命周期与三个 bug（0.2.0）</h2>
+<p>这一轮把「像 Codex 那样用」补齐，也修掉了第一轮遗留的三个真 bug。逐条给结论。</p>
+
+<h3>① 退出 DSH 宠物会跟着消失吗 —— 不会，这是 bug，已修</h3>
+<p>第一轮只靠「连续 45 秒拿不到状态就自己退出」看门，宿主退出后宠物会<b>在屏幕上干站 45 秒</b>。现在宿主把
+<code>process.ppid</code> 与 <code>process.execPath</code> 交给浮层（<code>--dsh-pid</code> / <code>--dsh-exe</code>），
+浮层每轮先用 <code>OpenProcess</code> + <code>GetExitCodeProcess</code> 判断宿主是否 <code>STILL_ACTIVE</code>，一没就退。
+实测 <code>--dsh-pid 999999</code> → 0.22 秒退出，日志 <code>DSH 已退出，浮层退出</code>。</p>
+<p>反过来，<b>DSH 关窗口 ≠ 退出</b>：Electron 里点关闭走 <code>mainWindow.hide()</code>（只有 <code>isQuitting()</code> 才 <code>close()</code>），
+所以窗口隐藏后宠物必须留着——这条顺带解释了下面第 ③ 条的根因。</p>
+
+<h3>② 托盘图标：已彻底去掉</h3>
+<p>托盘原本只做三件事，都有替代：系统气球 → 浮层自己的暖色气泡 + 提示音 + 跳跃/招手动画；菜单入口 → 宠物右键菜单；
+退出入口 → 菜单最后一项。于是 <code>NotifyIcon</code> 代码整体删除（源码计数 0），<code>notify/toast</code> 配置退役。</p>
+
+<h3>③ 「打开 DSH」有时没反应 —— 真 bug，两个根因叠加</h3>
+<table>
+  <tr><th style="width:22%">根因</th><th>细节</th><th style="width:34%">修法</th></tr>
+  <tr><td>只认可见窗口</td><td>旧实现 <code>if (!IsWindowVisible(h)) return;</code>，而 DSH 关窗口是 hide 到后台，窗口从此不可见 → 永远「找不到窗口」</td><td>按 pid 枚举、<b>不看可见性</b>，用打分挑主窗口（有标题 +10 / 可见 +5 / 非最小化 +2）</td></tr>
+  <tr><td>抢前台被拒</td><td>浮层是 <code>WS_EX_NOACTIVATE</code> 工具窗，从不拥有前台，<code>SetForegroundWindow</code> 被静默拒绝；旧代码没检查返回值，日志照样打「focused」</td><td>先 <code>ShowWindow(SW_SHOW/SW_RESTORE)</code>，再 <code>AttachThreadInput</code> 借前台输入队列，重试 3 次并校验 <code>GetForegroundWindow()==hWnd</code></td></tr>
+  <tr><td>兜底</td><td>主窗口真被销毁时无处可聚焦</td><td><code>Process.Start(dshExe)</code> → Electron <code>second-instance</code> 回调自动 restore/show/focus</td></tr>
+</table>
+<p>实测三种状态（正常 / <code>IsIconic=True</code> 最小化 / <code>ShowWindow(SW_HIDE)</code> 隐藏）下单击宠物都能拉起 DSH，
+日志 <code>focused DSH window (click) hwnd=…</code>。</p>
+
+<h3>④ 点击宠物直接打开 DSH</h3>
+<p><code>WM_LBUTTONUP</code> 且没拖动 → 先 <code>PostAck()</code>（有提醒就当「我知道了」）再 <code>FocusDsh("click")</code>。
+单击不再切换气泡展开——气泡按时间自动收起。</p>
+
+<h3>⑤ 就地写字 / 语音 / 鼠标离开收起</h3>
+<p>指针进入窗口 → 顶部浮出 78×34 胶囊工具条（✎ / 🎤），离开 300ms 收起。✎ 打开贴在宠物上方的圆角输入框
+（贴屏幕顶时自动翻到下方），Enter 发送 / Shift+Enter 换行 / Esc 关闭。发送走 <code>POST /say</code>，宿主用
+<code>sessionController.prompt({requestId, sessionId, mode:'queue', content:[{type:'text', text}]}, AbortSignal.timeout(15s))</code>
+把这句话<b>作为一条用户消息</b>投进当前会话——和你在输入框打字同一条链路。🎤 用 <code>SpeechRecognitionEngine</code> +
+<code>DictationGrammar</code>，<code>Hypothesized</code> 把草稿灰字实时填进输入框，停 3 秒自动结束；
+编译期 <code>#define:VOICE</code> + GAC 的 <code>System.Speech.dll</code>，没有引擎时只降级提示。</p>
+
+<h3>⑥ 右键菜单：自绘圆角半透明</h3>
+<p>不用系统 <code>ContextMenuStrip</code>。<code>OverlayMenu</code> 是一个分层窗口自己画：主列 + 子菜单是<b>同一窗口的两列</b>
+（子菜单开成子窗口会让父窗口失活、菜单自关）；底色高不透明度 + 1px 描边 + 三层递减阴影，深浅色跟随
+<code>AppsUseLightTheme</code>；子菜单靠右缘时整体左翻（窗口左边界反向抵消）；悬停用 90ms 定时器<b>轮询</b>光标——
+置顶无激活窗口不一定收得到 <code>WM_MOUSEMOVE</code>；Esc 逐级关闭。</p>
+<p class="note" style="color:var(--muted);font-size:14px">调试记录：左翻后主列文字整段消失，根因是 <code>DrawString</code> 的矩形宽度写成
+<code>rect.Width - textLeft</code> 而 <code>textLeft</code> 是绝对坐标，偏移一大宽度就变负；改成 <code>rect.Right - textLeft</code> 即好。</p>
+
+<h3>⑦ 气泡停留时长可设置</h3>
+<p><code>bubbleMs</code> 默认 5000（菜单可选 3 / 5 / 8 秒 / 一直显示 / 关闭气泡），<code>alertMs</code> 默认 30000。
+内容「变没变」用指纹判断，指纹里剔掉每秒跳动的 <code>第 N 步 · 45s</code>（<code>StripElapsed</code>），否则计时一刷新气泡就重新点亮、永远收不起来。</p>
+
+<h3>⑧ 位置持久，取消「重置位置」</h3>
+<p>松手 → <code>POST /config {pos:1,posx,posy}</code> → 原子写 <code>config.json</code>；启动按保存锚点还原，
+尺寸变化时按「底边中点」重新摆位并用 <code>Screen.WorkingArea</code> 夹回可见区，<code>WM_DPICHANGED</code> /
+<code>WM_DISPLAYCHANGE</code> 触发重新布局，插拔显示器不会把宠物丢到屏幕外。</p>
+
+<h3>⑨ 顺手补的 P1</h3>
+<table>
+  <tr><th style="width:26%">项</th><th>说明</th></tr>
+  <tr><td>深色主题</td><td>菜单 / 气泡 / 工具条按系统深浅色切调色板</td></tr>
+  <tr><td>错误可见</td><td>编译、网络、发送失败以红字进气泡或输入框，不再只写日志</td></tr>
+  <tr><td>结束时长提示</td><td><code>alert.age</code>：提醒超过 1 分钟，正文追加「N 分钟前结束」</td></tr>
+  <tr><td><code>/pet</code> 补全</td><td>新增 <code>bubble &lt;秒&gt;</code>、<code>say &lt;内容&gt;</code>、<code>test failed</code></td></tr>
+  <tr><td>中文换行</td><td>正文按 CJK 逐字断行（旧版按空格切，中文整段溢出成一行省略号）</td></tr>
+  <tr><td>断开可见</td><td>宿主失联 4 次后气泡写「DSH 已断开，重连中…」</td></tr>
+  <tr><td>图标重绘</td><td>蓝色徽章 + 对话气泡脸，<code>tools/make-icon.py</code> 出多尺寸 <code>app.ico</code></td></tr>
+</table>
+
+<h3>⑩ 这一轮的验收</h3>
+<table>
+  <tr><th style="width:26%">需求</th><th>结论 / 证据</th></tr>
+  <tr><td>宠物随 DSH 生死</td><td><code>--dsh-pid 999999</code> → 0.22s 退出；重新启用插件自动重启并回到原位置（<code>img/22-restored-0.2.png</code>）</td></tr>
+  <tr><td>去托盘图标</td><td><code>NotifyIcon</code> 计数 0，通知区无残留</td></tr>
+  <tr><td>「打开 DSH」bug</td><td>两处根因定位并修复；三态实测均能拉起</td></tr>
+  <tr><td>点击宠物打开 DSH</td><td>单击即拉起，日志 <code>focused DSH window (click)</code></td></tr>
+  <tr><td>就地写字</td><td><code>say result: 已发送</code>；宿主日志 <code>浮层消息 → &lt;sessionId&gt;：…</code>；当前会话收到该消息</td></tr>
+  <tr><td>语音</td><td>SAPI 两引擎可用，<code>#if VOICE</code> 编译通过；无引擎时降级提示</td></tr>
+  <tr><td>菜单美化</td><td><code>img/20-menu-0.2.png</code>：圆角半透明、真 ✓、子菜单左翻</td></tr>
+  <tr><td>气泡时长</td><td><code>bubbleMs=1000</code> 时 4 秒后气泡与工具条消失、宠物留在原地</td></tr>
+  <tr><td>位置持久</td><td>拖到左下写 <code>pos</code>，禁用→启用后原位复原（<code>img/22-restored-0.2.png</code>）</td></tr>
+  <tr><td>最小化仍可用</td><td><code>img/23-minimized-alert-0.2.png</code>：<code>IsIconic=True</code> 时宠物与失败提醒气泡都在桌面</td></tr>
+</table>
+
 <footer>
   dsh-pet · 交付物：<code>docs/DESIGN.md</code>（本文 Markdown 版）、<code>README.md</code>（安装/使用/验收）、<code>src/</code>（宿主插件）、<code>native/</code>（C# 浮层）、<code>test/</code>（回归）。
 </footer>
