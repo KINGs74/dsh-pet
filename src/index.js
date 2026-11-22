@@ -6,14 +6,17 @@
 // 为什么要有独立进程，见 src/overlay.js 顶部注释：DSH 桌面端不向插件开放窗口
 // 能力，任何"在页面里"的方案都会被面板裁剪，也就不满足"拖到全屏任意位置"。
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ConfigStore, PETS_ROOT } from './config-store.js';
+import { OverlayCompose } from './compose-targets.js';
 import { OverlaySupervisor, buildOverlay, writeRuntimeFile } from './overlay.js';
 import { PetModel, excerpt, textOfMessage } from './pet-state.js';
 import { installPet, listPets, powerShellPath } from './pets.js';
+import { startProfiler } from './profiler.js';
 import { PetHttpApi, PREFIX } from './routes.js';
 
 export const name = 'dsh-pet';
@@ -30,6 +33,12 @@ const OVERLAY_LOG = join(LOG_DIR, 'overlay.log');
 const TOAST_MS = 20_000;
 // 全新安装时先给一只默认宠物，用户打开就有东西可看（失败则保持占位图形）
 const DEFAULT_PET_SLUG = 'deepseek';
+
+function profileRequested() {
+  if (process.env.DSH_PET_PROFILE === '1') return true;
+  if (process.env.DSH_PET_PROFILE === '0') return false;
+  return existsSync(join(PETS_ROOT, 'profile.on'));
+}
 
 function stamp() {
   const d = new Date();
@@ -68,7 +77,13 @@ class PetService {
     this.toastText = '';
     this.toastAt = 0;
     this.supervisor = null;
-    this.sessionController = null;
+    this.compose = new OverlayCompose({
+      recentId: () => this.model.snapshot().sessionId,
+      language: () => this.store.get().lang,
+      onSent: (message) => this.setToast(message),
+      log,
+    });
+    this.profiler = null;
     this._alertSince = 0;
     this._alertIdSeen = '';
   }
@@ -135,14 +150,14 @@ class PetService {
     return config_lang(this.store.get().lang) === 'en' ? `${minutes} min ago` : `${minutes} 分钟前结束`;
   }
 
-  /** 从浮层发一条消息进当前会话（复用 sessionController.prompt，等价于用户在输入框里敲） */
+  /** 兼容 DSH 中的 /pet say 命令，其会话选择维持原有行为。 */
   async say(text) {
     const content = String(text ?? '').trim();
     if (!content) return '失败：消息是空的';
     const snapshot = this.model.snapshot();
     const sessionId = snapshot?.sessionId;
     if (!sessionId) return '失败：还没有进行中的对话，先在 DSH 里开一个会话';
-    const controller = this.sessionController;
+    const controller = this.compose.controller;
     if (!controller || typeof controller.prompt !== 'function') {
       return '失败：当前 DSH 版本没有开放 sessionController，无法从浮层发消息';
     }
@@ -153,11 +168,11 @@ class PetService {
         AbortSignal.timeout(15_000),
       );
       this.setToast('已发送');
-      this.log(`浮层消息 → ${sessionId}：${excerpt(content, 40)}`);
+      this.log('/pet say 消息已提交');
       return '已发送';
     } catch (error) {
       const message = error?.message ?? String(error);
-      this.log(`浮层消息失败：${message}`);
+      this.log('/pet say 消息发送失败');
       return `失败：${message}`;
     }
   }
@@ -241,6 +256,51 @@ class PetService {
     return 'ok';
   }
 
+  // 压测/误触时清空排队中的用户消息。updateQueue 只接受单条 itemId，
+  // 所以先 state() 拿到 queue，再逐条 remove（kind 必须是 {kind:'remove'}）。
+  async clearQueue() {
+    const controller = this.compose.controller;
+    const sessionId = this.model.snapshot()?.sessionId;
+    if (!controller || !sessionId) return '失败：没有可用的会话';
+    try {
+      // state()/updateQueue() 的第二个参数是必填的 AbortSignal，少传就会在内部
+      // throwIfAborted 上炸（'Cannot read properties of undefined'）。
+      const state = await controller.state({ sessionId }, AbortSignal.timeout(10_000));
+      const queue = Array.isArray(state?.queue) ? state.queue : [];
+      let removed = 0;
+      for (const item of queue) {
+        const itemId = item?.itemId ?? item?.id ?? item?.messageId;
+        if (!itemId) continue;
+        await controller.updateQueue(
+          { sessionId, itemId, action: { kind: 'remove' } },
+          AbortSignal.timeout(10_000),
+        );
+        removed += 1;
+      }
+      this.log(`清空排队消息 ${removed} 条`);
+      return `已清空 ${removed} 条排队消息`;
+    } catch (error) {
+      return `失败：${error?.message ?? error}`;
+    }
+  }
+
+  // 运行时开关采样：卡死是随机发生的，不能为了取证让用户重启 DSH，
+  // 所以给一条带 token 的 HTTP 通道（POST /profile {on:1}）随时开。
+  profile(body = {}) {
+    const on = String(body.on ?? '').trim();
+    if (on === '1' || on === 'true') {
+      if (this.profiler) return '采样已经开着';
+      this.profiler = startProfiler({ dir: LOG_DIR, log: this.log, thresholdMs: 1500 });
+      this.log('已开启事件循环采样（运行时开关）');
+      return '采样已开启';
+    }
+    if (!this.profiler) return '采样本来就没开';
+    const info = this.profiler.info();
+    void this.profiler.stop();
+    this.profiler = null;
+    return `采样已停止（profile ${info.profiles} 份，最大阻塞 ${info.maxLagMs}ms，p99 ${info.p99Ms}ms）`;
+  }
+
   overlayEvent(body = {}) {
     const event = String(body.event ?? '');
     if (event === 'ready') {
@@ -313,17 +373,37 @@ export function apply(ctx, pluginConfig = {}) {
     service.prefix = prefix;
     log(`已挂载 ${prefix}/* 到 ${safeOrigin(ctx)}`);
 
-    // 浮层里的「✎ 写一句话」最终落到 sessionController.prompt，
-    // 效果和用户在输入框里敲一条消息一样。老版本 DSH 没有这个服务时降级为不可用。
     const offController = ctx.inject(['sessionController'], (scope) => {
-      service.sessionController = scope.sessionController;
-      log('已接上 sessionController（浮层可以直接发消息）');
+      const unbind = service.compose.bind(scope.sessionController);
+      log('已接上 sessionController（浮层可以选择会话并发消息）');
+      return unbind;
     });
 
     const tick = setInterval(() => {
       service.refreshPets().catch(() => {});
     }, 15_000);
     tick.unref?.();
+
+    // 宿主事件循环看门狗：每 2 秒对一次表，超时说明这一侧的 JS 被同步操作拖住了。
+    // 卡死排查时 overlay.log 的 ui stall 与这里的 loop lag 一对照，立刻能分清是
+    // 浮层 UI 线程还是 DSH 宿主卡住（0.2 那次两个进程都有嫌疑，但没有证据可查）。
+    let lagExpected = Date.now() + 2000;
+    const lagTimer = setInterval(() => {
+      const now = Date.now();
+      const lag = now - lagExpected;
+      if (lag > 1500) log(`loop lag ${lag}ms`);
+      lagExpected = now + 2000;
+    }, 2000);
+    lagTimer.unref?.();
+
+    // 只有 DSH_PET_PROFILE=1 才开采样：常开会有采样线程的固定开销，
+    // 默认用户不该为排查付这笔钱。开了之后卡死会自己落一份 cpuprofile。
+    // 开关优先级：环境变量 > 标记文件。标记文件是为了"不重启 DSH 也能从启动那一刻开始采"，
+    // 卡死往往发生在启动后几秒，等插件起来再开采样就采不到了。
+    if (!service.profiler && profileRequested()) {
+      service.profiler = startProfiler({ dir: LOG_DIR, log, thresholdMs: 1500 });
+      log(`已开启事件循环采样（${process.env.DSH_PET_PROFILE === '1' ? 'DSH_PET_PROFILE=1' : '标记文件 profile.on'}）`);
+    }
 
     const onSessionEvent = (session, event) => {
       try {
@@ -382,7 +462,7 @@ export function apply(ctx, pluginConfig = {}) {
       return scope.commands.register({
         name: 'pet',
         description: '智能伙伴浮层：查看状态 / 切换宠物 / 安装 petdex 宠物',
-        input: { hint: 'status | pets | pet <名称> | scale <40-125> | bubble <秒> | say <内容> | install <petdex 名称或链接> | test' },
+        input: { hint: 'status | pets | pet <名称> | scale <40-125> | bubble <秒> | say <内容> | install <petdex 名称或链接> | test | restart' },
         handler: async (invocation) => {
           try {
             const [verb = 'status', ...rest] = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean);
@@ -401,7 +481,7 @@ export function apply(ctx, pluginConfig = {}) {
       const config = store.get();
       if (verb === 'status' || verb === '') {
         const st = service.state();
-        const overlay = st.overlay === 'running' ? '运行中' : st.overlay === 'unavailable' ? '不可用' : st.overlay;
+        const overlay = st.overlay === 'running' ? '运行中' : st.overlay === 'unavailable' ? '不可用（可用 /pet restart 重试）' : st.overlay;
         const petName = st.pet?.name ?? '未选择';
         return [
           `浮层：${overlay}`,
@@ -450,19 +530,24 @@ export function apply(ctx, pluginConfig = {}) {
         if (!arg) throw new Error('用法：/pet say 你好');
         return await service.say(arg);
       }
+      if (verb === 'restart') {
+        // 托盘已经拿掉了，浮层卡死/放弃重启后，这里是唯一能把它叫回来的入口
+        const status = await supervisor?.restart();
+        return status?.state === 'running' ? `浮层已重启 pid=${status.pid}` : `浮层重启失败：${status?.error || status?.state}`;
+      }
       if (verb === 'sound') {
         const on = arg !== 'off' && arg !== '0' && arg !== 'false';
         await service.configure({ sound: on ? '1' : '0' });
         return `提示音已${on ? '开启' : '关闭'}`;
       }
-      throw new Error(`未知子命令 ${verb}，可用：status / pets / pet / scale / bubble / say / install / test / sound`);
+      throw new Error(`未知子命令 ${verb}，可用：status / pets / pet / scale / bubble / say / install / test / sound / restart`);
     };
 
     let supervisor = null;
     const boot = async () => {
       try {
         await mkdir(LOG_DIR, { recursive: true });
-        await store.load();
+        await store.load((message) => log(`配置：${message}`));
         model.setLang?.(store.get().lang);
         const config = store.get();
         if (config.pet) model.setLang?.(config.lang);
@@ -519,7 +604,10 @@ export function apply(ctx, pluginConfig = {}) {
     });
 
     return async () => {
+      service.compose.dispose();
       clearInterval(tick);
+      clearInterval(lagTimer);
+      await service.profiler?.stop();
       // 单个 disposer 失败不能连坐：之前 offCommand 抛出过 TypeError，
       // 结果 unregister 被跳过，路由永久留在 webserver 上，重载就撞 duplicate。
       const dispose = (fn, label) => {

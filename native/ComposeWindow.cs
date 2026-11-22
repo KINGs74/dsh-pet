@@ -1,135 +1,215 @@
-// dsh-pet · 宠物旁边的"就地输入"小窗
-//
-// Codex 的交互是：鼠标移到宠物身上出现 ✎ / 🎤，点一下就在宠物旁边写字或说话。
-// 这里用真实的 WinForms 控件（TextBox 必须有真焦点才能输入），窗口本身圆角+描边，
-// Esc 关闭、Enter 发送、Shift+Enter 换行、点走且没内容就自动收起。
+// dsh-pet · 独立的文字和语音草稿窗
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Text;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace DshPet
 {
+    sealed class ComposeTarget
+    {
+        public readonly string Id;
+        public readonly string Title;
+        public readonly bool Recent;
+
+        public ComposeTarget(string id, string title, bool recent)
+        {
+            Id = id;
+            Title = title;
+            Recent = recent;
+        }
+    }
+
+    sealed class ComposeSubmitResult
+    {
+        public readonly bool Ok;
+        public readonly string Message;
+        public readonly bool Uncertain;
+
+        public ComposeSubmitResult(bool ok, string message, bool uncertain = false)
+        {
+            Ok = ok;
+            Message = message;
+            Uncertain = uncertain;
+        }
+    }
+
+    sealed class ComposeTextBox : TextBox
+    {
+        const int WmImeStartComposition = 0x010d;
+        const int WmImeEndComposition = 0x010e;
+
+        public bool Composing { get; private set; }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == WmImeStartComposition) Composing = true;
+            base.WndProc(ref message);
+            if (message.Msg == WmImeEndComposition) Composing = false;
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            Composing = false;
+            base.OnLostFocus(e);
+        }
+    }
+
     sealed class ComposeWindow : Form
     {
         readonly Func<string, string, string> _loc;
-        readonly Action<string> _submit;
-        readonly TextBox _input;
+        readonly Func<Task<ComposeTarget[]>> _load;
+        readonly Func<string, string, string, Task<ComposeSubmitResult>> _submit;
+        readonly ComposeTextBox _input;
+        readonly ComboBox _targets;
+        readonly Label _targetLabel;
         readonly Label _placeholder;
-        readonly Label _hint;
+        readonly Label _feedback;
+        readonly PillButton _refresh;
         readonly PillButton _send;
         readonly PillButton _mic;
-        readonly Timer _hintTimer;
         readonly Timer _deactivateTimer;
+        readonly float _scale;
+        readonly bool _startWithVoice;
+        readonly bool _english;
+        readonly Color _panel;
+        readonly Color _text;
+        readonly Color _dim;
+        readonly Color _warning;
+
+        ComposeTarget[] _choices = new ComposeTarget[0];
+        string _requestId;
+        string _requestText;
+        string _requestTarget;
+        bool _loadingTargets;
+        bool _sending;
+        bool _uncertain;
+        bool _shuttingDown;
+        bool _closed;
+
         VoiceInput _voice;
-        string _voiceBase = "";
+        Task _voiceCleanup = Task.FromResult(0);
+        StringBuilder _recognized;
+        string _recentVoiceSegment;
+        bool _startingVoice;
+        bool _stoppingVoice;
+        string _speechLanguage;
 
-        bool _dark;
-        Color _panel;
-        Color _border;
-        Color _text;
-        Color _dim;
-        Color _accent;
-
-        public ComposeWindow(Rectangle bounds, Func<string, string, string> loc, Action<string> submit, bool voice)
+        public ComposeWindow(Rectangle bounds, Func<string, string, string> loc,
+            Func<Task<ComposeTarget[]>> loadTargets,
+            Func<string, string, string, Task<ComposeSubmitResult>> submit, bool startVoice)
         {
             _loc = loc;
+            _load = loadTargets;
             _submit = submit;
+            _startWithVoice = startVoice;
+            _english = loc("zh", "en") == "en";
+            _scale = Math.Max(1f, bounds.Height / 224f);
 
+            Text = loc("宠物草稿", "Pet draft");
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             TopMost = true;
             StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
             DoubleBuffered = true;
+            Font = new Font("Microsoft YaHei UI", 9f);
 
-            _dark = IsDarkTheme();
-            if (_dark)
-            {
-                _panel = Color.FromArgb(255, 32, 34, 41);
-                _border = Color.FromArgb(255, 66, 70, 84);
-                _text = Color.FromArgb(255, 232, 235, 243);
-                _dim = Color.FromArgb(255, 138, 143, 156);
-                _accent = Color.FromArgb(255, 92, 140, 255);
-            }
-            else
-            {
-                _panel = Color.FromArgb(255, 253, 253, 255);
-                _border = Color.FromArgb(255, 214, 218, 230);
-                _text = Color.FromArgb(255, 32, 36, 48);
-                _dim = Color.FromArgb(255, 140, 146, 160);
-                _accent = Color.FromArgb(255, 43, 108, 246);
-            }
+            bool dark = IsDarkTheme();
+            _panel = dark ? Color.FromArgb(32, 34, 41) : Color.FromArgb(253, 253, 255);
+            _text = dark ? Color.FromArgb(232, 235, 243) : Color.FromArgb(32, 36, 48);
+            _dim = dark ? Color.FromArgb(171, 175, 190) : Color.FromArgb(94, 101, 119);
+            _warning = dark ? Color.FromArgb(255, 174, 174) : Color.FromArgb(169, 47, 47);
+            Color border = dark ? Color.FromArgb(83, 88, 105) : Color.FromArgb(210, 216, 231);
+            Color accent = dark ? Color.FromArgb(57, 101, 215) : Color.FromArgb(40, 89, 205);
             BackColor = _panel;
 
-            _input = new TextBox();
+            _targetLabel = NewLabel(_dim);
+            Controls.Add(_targetLabel);
+            _refresh = new PillButton(loc("刷新", "Refresh"), _panel, _text);
+            _refresh.Border = true;
+            _refresh.BorderColor = border;
+            _refresh.AccessibleName = loc("刷新会话列表", "Refresh session list");
+            _refresh.Click += delegate { LoadTargets(); };
+            Controls.Add(_refresh);
+
+            _targets = new ComboBox();
+            _targets.DropDownStyle = ComboBoxStyle.DropDownList;
+            _targets.BackColor = _panel;
+            _targets.ForeColor = _text;
+            _targets.MaxDropDownItems = 8;
+            _targets.AccessibleName = loc("发送到 DSH 会话", "Destination DSH session");
+            _targets.SelectedIndexChanged += delegate { UpdateActions(); };
+            _targets.DropDownClosed += delegate
+            {
+                if (!ContainsFocus && !_closed) _deactivateTimer.Start();
+            };
+            Controls.Add(_targets);
+
+            _input = new ComposeTextBox();
             _input.Multiline = true;
+            _input.AcceptsReturn = true;
             _input.BorderStyle = BorderStyle.None;
             _input.BackColor = _panel;
             _input.ForeColor = _text;
-            _input.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
             _input.ScrollBars = ScrollBars.Vertical;
+            _input.MaxLength = 6000;
+            _input.AccessibleName = loc("消息草稿", "Message draft");
             _input.KeyDown += OnInputKeyDown;
             _input.TextChanged += delegate
             {
                 _placeholder.Visible = _input.TextLength == 0;
-                _hint.Visible = false;
+                UpdateActions();
             };
-            // 占位文案在输入框为空时就该一直显示，只有真的开始打字才隐藏
-            _input.GotFocus += delegate { _placeholder.Visible = _input.TextLength == 0; };
-            _input.LostFocus += delegate { _placeholder.Visible = _input.TextLength == 0; };
             Controls.Add(_input);
 
-            _placeholder = new Label();
-            _placeholder.AutoSize = false;
-            _placeholder.BackColor = _panel;
-            _placeholder.ForeColor = _dim;
-            _placeholder.Font = _input.Font;
-            _placeholder.Text = _loc("给智能伙伴写一句话…", "Message your companion…");
+            _placeholder = NewLabel(_dim);
+            _placeholder.Text = loc("给智能伙伴写点什么…", "Message your companion…");
+            _placeholder.AccessibleRole = AccessibleRole.StaticText;
             _placeholder.Click += delegate { _input.Focus(); };
             Controls.Add(_placeholder);
-            // WinForms 里后加的控件在 z 序下层，占位文案会被 TextBox 盖住，必须提到最前
             _placeholder.BringToFront();
 
-            _hint = new Label();
-            _hint.AutoSize = false;
-            _hint.BackColor = _panel;
-            _hint.ForeColor = Color.FromArgb(255, 214, 74, 74);
-            _hint.Font = new Font("Microsoft YaHei UI", 8f, FontStyle.Regular, GraphicsUnit.Point);
-            _hint.Visible = false;
-            Controls.Add(_hint);
+            _feedback = NewLabel(_dim);
+            _feedback.TextAlign = ContentAlignment.MiddleLeft;
+            Controls.Add(_feedback);
 
-            _send = new PillButton(_loc("发送", "Send"), _accent, Color.White);
-            _send.Click += delegate { DoSubmit(); };
+            _send = new PillButton(loc("发送", "Send"), accent, Color.White);
+            _send.Click += delegate { Submit(); };
             Controls.Add(_send);
 
-            _mic = new PillButton(_loc("语音", "Voice"), _panel, _text);
+            _mic = new PillButton(loc("听写", "Dictate"), _panel, _text);
             _mic.Border = true;
-            _mic.BorderColor = _border;
-            _mic.Click += delegate { ToggleVoice(); };
-            Controls.Add(_mic);
-
-            _hintTimer = new Timer();
-            _hintTimer.Interval = 4000;
-            _hintTimer.Tick += delegate
+            _mic.BorderColor = border;
+            _mic.Click += delegate
             {
-                _hintTimer.Stop();
-                _hint.Visible = false;
+                if (_voice == null) StartVoice();
+                else StopVoice();
             };
+            Controls.Add(_mic);
 
             _deactivateTimer = new Timer();
             _deactivateTimer.Interval = 160;
             _deactivateTimer.Tick += delegate
             {
                 _deactivateTimer.Stop();
-                if (!ContainsFocus && _input.TextLength == 0 && (_voice == null || !_voice.Recording)) Close();
+                if (!ContainsFocus && !_targets.DroppedDown && _input.TextLength == 0 &&
+                    !_sending && _voice == null) Close();
             };
 
-            // 控件都建好之后再定尺寸：早先在建控件前 Size 赋值会触发 OnResize，
-            // LayoutChildren 摸到 null 控件抛 NullReferenceException（浮层日志里能看到）。
             Bounds = bounds;
-            LayoutChildren();
-            ApplyRoundRegion();
-            if (voice) BeginInvoke(new Action(ToggleVoice));
+            UpdateActions();
+        }
+
+        Label NewLabel(Color foreground)
+        {
+            Label label = new Label();
+            label.AutoEllipsis = true;
+            label.BackColor = _panel;
+            label.ForeColor = foreground;
+            return label;
         }
 
         static bool IsDarkTheme()
@@ -139,67 +219,42 @@ namespace DshPet
                 object value = Microsoft.Win32.Registry.GetValue(
                     @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
                     "AppsUseLightTheme", 1);
-                if (value is int) return (int)value == 0;
+                return value is int && (int)value == 0;
             }
-            catch
-            {
-            }
-            return false;
+            catch { return false; }
+        }
+
+        int S(int value)
+        {
+            return (int)Math.Round(value * _scale);
         }
 
         void LayoutChildren()
         {
-            if (_input == null || _placeholder == null || _hint == null || _send == null || _mic == null) return;
-            int pad = 12;
-            int buttonH = 26;
-            int buttonW = 64;
-            int inputH = Height - pad * 2 - buttonH - 6;
-            if (inputH < 28) inputH = 28;
-            _input.SetBounds(pad, pad, Width - pad * 2, inputH);
-            _placeholder.SetBounds(pad + 1, pad + 2, Width - pad * 2 - 2, inputH);
-            _hint.SetBounds(pad, Height - pad - buttonH, Width - pad * 2 - buttonW * 2 - 16, buttonH);
-            _send.SetBounds(Width - pad - buttonW, Height - pad - buttonH, buttonW, buttonH);
-            _mic.SetBounds(Width - pad - buttonW * 2 - 8, Height - pad - buttonH, buttonW, buttonH);
-        }
+            if (_mic == null) return;
+            int pad = S(12);
+            int width = Math.Max(1, ClientSize.Width - pad * 2);
+            int buttonH = S(28);
+            int buttonW = S(76);
+            int footerY = ClientSize.Height - pad - buttonH;
+            int statusH = S(39);
+            _targetLabel.SetBounds(pad, pad + S(3), Math.Max(1, width - buttonW - S(8)), S(20));
+            _refresh.SetBounds(ClientSize.Width - pad - buttonW, pad, buttonW, S(23));
+            _targets.SetBounds(pad, _refresh.Bottom + S(7), width, _targets.PreferredHeight);
+            int inputY = _targets.Bottom + S(12);
+            int inputH = Math.Max(S(22), footerY - inputY - statusH);
+            _input.SetBounds(pad + S(2), inputY, Math.Max(1, width - S(4)), inputH);
+            _placeholder.SetBounds(_input.Left + 1, _input.Top + 1, Math.Max(1, width - S(20)), S(23));
+            _feedback.SetBounds(pad, footerY - statusH, width, statusH - S(3));
+            _mic.SetBounds(ClientSize.Width - pad - buttonW * 2 - S(6), footerY, buttonW, buttonH);
+            _send.SetBounds(ClientSize.Width - pad - buttonW, footerY, buttonW, buttonH);
 
-        void ApplyRoundRegion()
-        {
-            using (GraphicsPath path = RoundRect(new Rectangle(0, 0, Width, Height), 12))
+            if (Width < 2 || Height < 2) return;
+            using (GraphicsPath path = PillButton.RoundRect(new Rectangle(0, 0, Width, Height), S(12)))
             {
-                Region old = Region;
+                Region previous = Region;
                 Region = new Region(path);
-                if (old != null) old.Dispose();
-            }
-        }
-
-        static GraphicsPath RoundRect(Rectangle rect, int radius)
-        {
-            GraphicsPath path = new GraphicsPath();
-            int d = Math.Max(2, Math.Min(radius * 2, Math.Min(rect.Width, rect.Height)));
-            path.AddArc(rect.X, rect.Y, d, d, 180, 90);
-            path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
-            path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
-            path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
-            path.CloseFigure();
-            return path;
-        }
-
-        protected override void OnPaintBackground(PaintEventArgs e)
-        {
-            using (SolidBrush brush = new SolidBrush(_panel))
-            {
-                e.Graphics.FillRectangle(brush, ClientRectangle);
-            }
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            base.OnPaint(e);
-            using (GraphicsPath path = RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), 12))
-            using (Pen pen = new Pen(_border, 1f))
-            {
-                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                e.Graphics.DrawPath(pen, path);
+                if (previous != null) previous.Dispose();
             }
         }
 
@@ -207,7 +262,6 @@ namespace DshPet
         {
             base.OnResize(e);
             LayoutChildren();
-            ApplyRoundRegion();
         }
 
         protected override void OnShown(EventArgs e)
@@ -215,128 +269,313 @@ namespace DshPet
             base.OnShown(e);
             Activate();
             _input.Focus();
+            LoadTargets();
+            if (_startWithVoice) StartVoice();
         }
 
         protected override void OnDeactivate(EventArgs e)
         {
             base.OnDeactivate(e);
-            _deactivateTimer.Start();
+            if (_deactivateTimer != null && !_closed) _deactivateTimer.Start();
         }
 
         protected override void OnActivated(EventArgs e)
         {
             base.OnActivated(e);
-            _deactivateTimer.Stop();
+            if (_deactivateTimer != null) _deactivateTimer.Stop();
+        }
+
+        ComposeTarget SelectedTarget
+        {
+            get
+            {
+                int index = _targets.SelectedIndex;
+                return index >= 0 && index < _choices.Length ? _choices[index] : null;
+            }
+        }
+
+        async void LoadTargets()
+        {
+            if (_loadingTargets || _sending || _closed) return;
+            string previousId = SelectedTarget == null ? null : SelectedTarget.Id;
+            _loadingTargets = true;
+            UpdateActions();
+            try
+            {
+                ComposeTarget[] choices = await _load();
+                if (_closed) return;
+                _targets.BeginUpdate();
+                try
+                {
+                    _choices = choices ?? new ComposeTarget[0];
+                    _targets.Items.Clear();
+                    int selected = -1;
+                    for (int i = 0; i < _choices.Length; i++)
+                    {
+                        ComposeTarget choice = _choices[i];
+                        _targets.Items.Add(choice.Title + (choice.Recent ? _loc("（最近活动）", " (recent)") : ""));
+                        if (previousId != null ? previousId == choice.Id : choice.Recent && selected < 0) selected = i;
+                    }
+                    if (previousId == null && selected < 0 && _choices.Length == 1) selected = 0;
+                    _targets.SelectedIndex = selected;
+                }
+                finally { _targets.EndUpdate(); }
+            }
+            catch (Exception)
+            {
+                if (!_closed) Feedback(_loc("读取会话失败，请刷新后重试。", "Could not load sessions. Refresh to retry."), true);
+            }
+            finally
+            {
+                _loadingTargets = false;
+                if (!_closed) UpdateActions();
+            }
+        }
+
+        void UpdateActions()
+        {
+            if (_mic == null || _closed) return;
+            ComposeTarget target = SelectedTarget;
+            _targetLabel.Text = _loadingTargets ? _loc("正在读取 DSH 会话…", "Loading DSH sessions…") :
+                _choices.Length == 0 ? _loc("没有可用的 DSH 会话", "No available DSH sessions") :
+                target == null ? _loc("请选择发送会话", "Choose a session") : _loc("发送到 DSH 会话", "Send to DSH session");
+            _targets.Enabled = !_sending && !_loadingTargets && _choices.Length != 0;
+            _refresh.Enabled = !_sending && !_loadingTargets;
+            _input.ReadOnly = _sending;
+            _mic.Enabled = !_sending && !_startingVoice && !_stoppingVoice;
+            _mic.Text = _startingVoice ? _loc("连接中…", "Starting…") :
+                _stoppingVoice ? _loc("转写中…", "Finishing…") :
+                _voice != null ? _loc("停止", "Stop") : _loc("听写", "Dictate");
+            _send.Enabled = !_loadingTargets && !_sending && target != null && _voice == null &&
+                !String.IsNullOrWhiteSpace(_input.Text);
+            _send.Text = _sending ? _loc("发送中…", "Sending…") : _loc("发送", "Send");
         }
 
         void OnInputKeyDown(object sender, KeyEventArgs e)
         {
-            if (e.KeyCode == Keys.Escape)
+            if (_input.Composing || e.KeyCode == Keys.ProcessKey) return;
+            if (e.KeyCode == Keys.Enter && !e.Shift && !e.Control && !e.Alt)
             {
                 e.SuppressKeyPress = true;
+                Submit();
+            }
+        }
+
+        protected override bool ProcessCmdKey(ref Message message, Keys keyData)
+        {
+            if (keyData == Keys.Escape && !_targets.DroppedDown && !_input.Composing)
+            {
                 Close();
+                return true;
             }
-            else if (e.KeyCode == Keys.Enter && !e.Shift && !e.Control)
+            return base.ProcessCmdKey(ref message, keyData);
+        }
+
+        async void Submit()
+        {
+            if (!_send.Enabled || _input.Composing) return;
+            ComposeTarget target = SelectedTarget;
+            string draft = _input.Text.Trim();
+            if (_uncertain && (_requestText != draft || _requestTarget != target.Id))
             {
-                e.SuppressKeyPress = true;
-                DoSubmit();
+                DialogResult confirm = MessageBox.Show(this,
+                    _loc("上一次发送结果待确认。这次修改后的草稿会作为一条新消息发送。继续吗？",
+                        "The previous send is unconfirmed. The changed draft will be sent as a new message. Continue?"),
+                    Text, MessageBoxButtons.OKCancel, MessageBoxIcon.Information, MessageBoxDefaultButton.Button2);
+                if (confirm != DialogResult.OK) return;
             }
-        }
-
-        void DoSubmit()
-        {
-            string text = _input.Text;
-            if (text == null || text.Trim().Length == 0) return;
-            if (_submit != null) _submit(text.Trim());
-        }
-
-        public void ShowError(string message)
-        {
-            if (IsDisposed) return;
-            _hint.Text = message.Length > 120 ? message.Substring(0, 120) + "…" : message;
-            _hint.Visible = true;
-            _hintTimer.Stop();
-            _hintTimer.Start();
-        }
-
-        public void SetText(string text)
-        {
-            _input.Text = text;
-            _input.SelectionStart = _input.TextLength;
-        }
-
-        // ================= 语音 =================
-
-        void ToggleVoice()
-        {
-            if (_voice == null) _voice = new VoiceInput();
-            if (_voice.Recording)
+            if (_requestId == null || _requestTarget != target.Id || _requestText != draft)
             {
-                _voice.Stop();
-                _mic.Text = _loc("语音", "Voice");
-                _mic.Invalidate();
+                _requestId = Guid.NewGuid().ToString("N");
+                _requestTarget = target.Id;
+                _requestText = draft;
+                _uncertain = false;
+            }
+            _sending = true;
+            UpdateActions();
+            Feedback(_loc("正在提交给 DSH…", "Submitting to DSH…"), false);
+            ComposeSubmitResult result;
+            try
+            {
+                result = await _submit(target.Id, draft, _requestId);
+            }
+            catch (Exception)
+            {
+                result = new ComposeSubmitResult(false, "", true);
+            }
+            if (_closed) return;
+            _sending = false;
+            UpdateActions();
+            if (result != null && result.Ok)
+            {
+                Close();
                 return;
             }
-            if (!_voice.Available)
+            _uncertain = _uncertain || result == null || result.Uncertain;
+            string message = result == null ? "" : result.Message;
+            if (String.IsNullOrWhiteSpace(message))
             {
-                ShowError(_voice.UnavailableReason);
-                return;
+                message = _uncertain
+                    ? _loc("发送结果待确认。可重试同一份草稿。", "Send unconfirmed. You can retry this draft.")
+                    : _loc("发送失败，请重试。", "Send failed. Please retry.");
             }
-            _voiceBase = _input.TextLength == 0 ? "" : _input.Text.TrimEnd() + " ";
-            _voice.Reset();
-            _voice.Partial += OnVoicePartial;
-            _voice.Final += OnVoiceFinal;
-            _voice.Failed += OnVoiceFailed;
-            _voice.Start();
-            _mic.Text = _loc("停止", "Stop");
-            _mic.Invalidate();
+            Feedback(message, true);
             _input.Focus();
         }
 
-        void OnVoiceFinal(string text)
+        void Feedback(string message, bool warning)
         {
-            if (IsDisposed || !IsHandleCreated) return;
-            BeginInvoke(new Action(delegate
-            {
-                _voiceBase = _voiceBase + text + " ";
-                SetText(_voiceBase);
-                _mic.Text = _loc("语音", "Voice");
-                _mic.Invalidate();
-                if (_voice != null) _voice.Stop();
-            }));
+            _feedback.ForeColor = warning ? _warning : _dim;
+            _feedback.Text = message;
+            _feedback.AccessibleName = message;
         }
 
-        void OnVoicePartial(string text)
+        public async void StartVoice()
         {
-            if (IsDisposed || !IsHandleCreated) return;
-            BeginInvoke(new Action(delegate
+            if (_closed || _sending || _voice != null) return;
+            VoiceInput voice = new VoiceInput(_english);
+            _voice = voice;
+            _recognized = new StringBuilder();
+            _recentVoiceSegment = "";
+            _startingVoice = true;
+            _speechLanguage = "";
+            voice.Partial += delegate(string text) { DispatchVoice(voice, delegate { ShowVoicePreview(text); }); };
+            voice.Final += delegate(string text) { DispatchVoice(voice, delegate { AcceptVoiceSegment(text); }); };
+            voice.Completed += delegate(string error) { DispatchVoice(voice, delegate { FinishVoice(error); }); };
+            UpdateActions();
+            Feedback(_loc("正在打开麦克风…", "Opening microphone…"), false);
+            try
             {
-                SetText((_voiceBase + text).TrimStart());
-            }));
+                await _voiceCleanup;
+                if (_closed || _voice != voice) return;
+                string language = await Task.Run(new Func<string>(voice.Start));
+                if (_closed || _voice != voice) return;
+                _speechLanguage = language;
+                _startingVoice = false;
+                UpdateActions();
+                ShowVoicePreview("");
+            }
+            catch (Exception error)
+            {
+                if (!_closed && _voice == voice)
+                    FinishVoice(_loc("听写不可用：", "Dictation unavailable: ") + error.Message);
+            }
         }
 
-        void OnVoiceFailed(string message)
+        async void StopVoice()
         {
-            if (IsDisposed || !IsHandleCreated) return;
-            BeginInvoke(new Action(delegate
+            VoiceInput voice = _voice;
+            if (voice == null || _startingVoice || _stoppingVoice) return;
+            _stoppingVoice = true;
+            UpdateActions();
+            ShowVoicePreview("");
+            try { await Task.Run(new Action(voice.Stop)); }
+            catch (Exception error)
             {
-                ShowError(message);
-                _mic.Text = _loc("语音", "Voice");
-                _mic.Invalidate();
-            }));
+                if (!_closed && _voice == voice)
+                    FinishVoice(_loc("停止听写失败：", "Could not stop dictation: ") + error.Message);
+            }
+        }
+
+        void DispatchVoice(VoiceInput voice, Action callback)
+        {
+            try
+            {
+                BeginInvoke(new Action(delegate
+                {
+                    if (!_closed && _voice == voice) callback();
+                }));
+            }
+            catch (InvalidOperationException) { }
+        }
+
+        void ShowVoicePreview(string partial)
+        {
+            string preview = partial.Length == 0 ? _recentVoiceSegment : partial;
+            string status = _stoppingVoice ? _loc("正在完成转写", "Finishing dictation") :
+                _loc("正在听写", "Listening") + (_speechLanguage.Length == 0 ? "" : " (" + _speechLanguage + ")");
+            Feedback(preview.Length == 0 ? status : status + Environment.NewLine + preview, false);
+        }
+
+        void AcceptVoiceSegment(string text)
+        {
+            _recentVoiceSegment = text;
+            int remaining = _input.MaxLength + 1 - _recognized.Length;
+            if (remaining > 0)
+            {
+                if (_recognized.Length > 0)
+                {
+                    _recognized.Append(' ');
+                    remaining--;
+                }
+                _recognized.Append(text, 0, Math.Min(text.Length, remaining));
+            }
+            ShowVoicePreview("");
+        }
+
+        void FinishVoice(string error)
+        {
+            string recognized = _recognized.ToString();
+            ReleaseVoice();
+            string prefix = _input.TextLength == 0 ? "" : Environment.NewLine;
+            int available = Math.Max(0, _input.MaxLength - _input.TextLength - prefix.Length);
+            int insertLength = Math.Min(recognized.Length, available);
+            if (insertLength > 0 && Char.IsHighSurrogate(recognized[insertLength - 1])) insertLength--;
+            if (insertLength > 0)
+            {
+                _input.AppendText(prefix + recognized.Substring(0, insertLength));
+                _input.SelectionStart = _input.TextLength;
+                if (ContainsFocus) _input.Focus();
+            }
+            UpdateActions();
+            if (!String.IsNullOrEmpty(error)) Feedback(error, true);
+            else if (recognized.Length > insertLength)
+                Feedback(_loc("草稿已达长度上限。", "The draft has reached its length limit."), true);
+            else if (recognized.Length == 0)
+                Feedback(_loc("没有识别到语音。", "No speech was recognized."), false);
+            else Feedback(_loc("已加入草稿，可编辑后发送。", "Added to the draft. Review before sending."), false);
+        }
+
+        void ReleaseVoice()
+        {
+            VoiceInput voice = _voice;
+            _voice = null;
+            _recognized = null;
+            _startingVoice = false;
+            _stoppingVoice = false;
+            if (voice != null)
+            {
+                Task previous = _voiceCleanup;
+                _voiceCleanup = Task.Run(async delegate
+                {
+                    await previous.ConfigureAwait(false);
+                    try { voice.Dispose(); }
+                    catch (Exception error) { System.Diagnostics.Debug.WriteLine(error.Message); }
+                });
+            }
+        }
+
+        public void CloseForShutdown()
+        {
+            _shuttingDown = true;
+            Close();
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (_sending && !_shuttingDown && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Feedback(_loc("发送仍在进行，请稍候。", "The message is still being sent."), false);
+            }
+            base.OnFormClosing(e);
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
-            _hintTimer.Stop();
-            _hintTimer.Dispose();
-            _deactivateTimer.Stop();
+            _closed = true;
             _deactivateTimer.Dispose();
-            if (_voice != null)
-            {
-                _voice.Dispose();
-                _voice = null;
-            }
+            ReleaseVoice();
             base.OnFormClosed(e);
         }
     }
@@ -366,12 +605,12 @@ namespace DshPet
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             Rectangle rect = new Rectangle(0, 0, Width - 1, Height - 1);
-            using (GraphicsPath path = ComposeWindow_RoundRect(rect, 6))
+            using (GraphicsPath path = RoundRect(rect, 6))
             {
-                Color fill = _fill;
+                Color fill = Enabled ? _fill : ControlPaint.Light(_fill, 0.45f);
                 if (_fill.A > 0 && _fill != Color.Transparent)
                 {
-                    if (ClientRectangle.Contains(PointToClient(Cursor.Position)))
+                    if (Enabled && ClientRectangle.Contains(PointToClient(Cursor.Position)))
                     {
                         fill = ControlPaint.Light(_fill, 0.12f);
                     }
@@ -388,11 +627,11 @@ namespace DshPet
                     }
                 }
             }
-            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor,
+            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, Enabled ? ForeColor : SystemColors.GrayText,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
 
-        static GraphicsPath ComposeWindow_RoundRect(Rectangle rect, int radius)
+        internal static GraphicsPath RoundRect(Rectangle rect, int radius)
         {
             GraphicsPath path = new GraphicsPath();
             int d = Math.Max(2, Math.Min(radius * 2, Math.Min(rect.Width, rect.Height)));

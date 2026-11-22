@@ -3,7 +3,7 @@
 // 配置存放在 ~/.dsh/pets/config.json，与 DSH 自己的 profile 配置完全分开：
 // 插件不去改 profile 的 cordis.patch.yml（那是 DSH 的所有物），只维护自己的
 // 小型 JSON 文档，写入用「临时文件 + rename」保证原子性。
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -65,15 +65,43 @@ export class ConfigStore {
     this._pending = null;
   }
 
-  async load() {
+  async load(report = () => {}) {
     try {
       const text = await readFile(this.file, 'utf8');
       this.config = normalizeConfig(JSON.parse(text));
+      this._corrupt = false;
     } catch (error) {
-      if (error?.code !== 'ENOENT') {
-        // 坏文件不应让插件启动失败：退回默认值，下一次写入时覆盖
-        this.config = { ...DEFAULT_CONFIG };
+      if (error?.code === 'ENOENT') {
+        this._corrupt = false;
+        return this.config;
       }
+      // 坏文件不能让插件启动失败，也不能被"默认值"直接覆盖掉用户原来的内容：
+      // 先把坏文件留档成 config.json.corrupt-<时间戳>，再从 .bak / .prev 回滚。
+      this._corrupt = true;
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const keep = `${this.file}.corrupt-${stamp}`;
+      try {
+        await copyFile(this.file, keep);
+        report(`配置解析失败（${error?.message ?? error}），原文件已留档为 ${keep}`);
+      } catch (copyError) {
+        report(`配置解析失败，留档也失败：${copyError?.message ?? copyError}`);
+      }
+      for (const fallback of [`${this.file}.bak`, `${this.file}.prev`]) {
+        try {
+          const text = await readFile(fallback, 'utf8');
+          this.config = normalizeConfig(JSON.parse(text));
+          report(`已从 ${fallback} 恢复配置`);
+          // 立刻把恢复结果写回原文件：否则下次启动又要再走一遍回滚，
+          // 而且磁盘上一直留着一份坏 JSON。这里绕开 .bak/.prev 轮转，
+          // 避免把损坏内容写进备份。
+          await this._writeRecovered();
+          return this.config;
+        } catch {
+          // 下一个候选
+        }
+      }
+      report('没有可用的备份，使用默认配置（原文件已留档）');
+      this.config = { ...DEFAULT_CONFIG };
     }
     return this.config;
   }
@@ -96,10 +124,64 @@ export class ConfigStore {
     return next;
   }
 
+  /**
+   * 落盘。三步保证"任何时刻磁盘上都有一份能读的配置"：
+   *   1. 首次写入前把现有文件复制成 config.json.bak（只在不存在时做，不覆盖更早的备份）
+   *   2. 写临时文件 → rename 覆盖（rename 是原子的，不会出现半截 JSON）
+   *   3. 更新前先把当前文件留成 config.json.prev
+   * 影响面：只碰 ~/.dsh/pets/config.json 及其 .bak/.prev 兄弟文件，从不写会话数据。
+   */
   async _write() {
     await mkdir(dirname(this.file), { recursive: true });
+    await this._backupOnce();
+    await this._rotatePrev();
     const tmp = `${this.file}.${process.pid}.tmp`;
     await writeFile(tmp, `${JSON.stringify(this.config, null, 2)}\n`, 'utf8');
     await rename(tmp, this.file);
+  }
+
+  /** 回滚后直接把恢复结果写回原文件（不动 .bak / .prev） */
+  async _writeRecovered() {
+    try {
+      await mkdir(dirname(this.file), { recursive: true });
+      const tmp = `${this.file}.${process.pid}.tmp`;
+      await writeFile(tmp, `${JSON.stringify(this.config, null, 2)}\n`, 'utf8');
+      await rename(tmp, this.file);
+    } catch {
+      // 写不回去也不影响本次运行，内存里的配置已经是恢复过的
+    }
+  }
+
+  async _backupOnce() {
+    const bak = `${this.file}.bak`;
+    try {
+      await stat(bak);
+      return;
+    } catch {
+      // 还没有 .bak，继续
+    }
+    try {
+      await stat(this.file);
+    } catch {
+      return; // 还没有配置文件，没什么可备份
+    }
+    try {
+      await copyFile(this.file, bak);
+    } catch {
+      // 备份失败不阻断写入
+    }
+  }
+
+  async _rotatePrev() {
+    try {
+      await stat(this.file);
+    } catch {
+      return;
+    }
+    try {
+      await copyFile(this.file, `${this.file}.prev`);
+    } catch {
+      // 同上，尽力而为
+    }
   }
 }

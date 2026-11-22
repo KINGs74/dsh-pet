@@ -291,6 +291,206 @@
   <tr><td>最小化仍可用</td><td><code>img/23-minimized-alert-0.2.png</code>：<code>IsIconic=True</code> 时宠物与失败提醒气泡都在桌面</td></tr>
 </table>
 
+<h2><span class="num">13</span>第三轮改动：卡死根因、菜单点不动、动作行下移（0.3.0）</h2>
+<p>这一轮的重点不是加功能，而是回答三个「为什么」：为什么会卡死、为什么菜单点不动、
+为什么最外面那一圈框要去掉。所有结论都带证据行。</p>
+
+<h3>① 0.2 的随机卡死：<code>AttachThreadInput</code> 把浮层的线程缝进了 Electron 的输入队列</h3>
+<p>0.2 为了让「打开 DSH」在被系统拒绝抢前台时也能成功，用了这套写法：</p>
+<pre>AttachThreadInput(myThread, foregroundThread, true);   // 借前台窗口的输入队列
+SetForegroundWindow(hWnd);
+AttachThreadInput(myThread, foregroundThread, false);  // 3 次重试，每次间隔 80ms</pre>
+<p><code>foregroundThread</code> 通常就是 Electron 的 UI 线程。<b>Attach 之后两条线程共享输入队列，
+Electron 的窗口消息有可能被浮层线程取走并派发</b>——Electron 的界面就离开了自己的 UI 线程，
+表现就是「随机卡死、界面完全不动、但进程还在」。随机性来自：只有「抢前台被拒」这条分支才会 Attach，
+只挂几十毫秒，只有恰好和 Electron 的消息处理撞上才出事。</p>
+<p>更糟的是兜底：<code>Process.Start(dshExe)</code> 会在同一份 userData 上再拉起一个 Electron 实例。</p>
+<table>
+  <tr><th style="width:30%">证据</th><th>内容</th></tr>
+  <tr><td>代码层面</td><td>0.1 里没有 <code>AttachThreadInput</code>、也没有 relaunch 兜底；0.2 才有，卡死也是 0.2 才出现</td></tr>
+  <tr><td><code>overlay.log</code></td><td><code>focus refused (click), falling back to relaunch</code> + <code>relaunched DSH exe</code>，时间 03:38:58 / 03:41:33 / 03:48:21</td></tr>
+  <tr><td><code>host.log</code></td><td>卡死期间宿主一直健康：只有 3 条孤立 <code>poll failed</code>，从没出现 <code>DSH 已断开</code> / <code>host unreachable</code> ⇒ 卡住的是 Electron 进程，不是 Node 宿主</td></tr>
+  <tr><td>Windows 事件日志</td><td>03:20–04:05 没有 WER 的 AppHang / AppError 记录 ⇒ 不是崩溃，是进程内挂住</td></tr>
+</table>
+<p><b>修法</b>（两条路径全删）：<code>Activate()</code> = <code>ShowWindowAsync</code> → <code>SetWindowPos(HWND_TOP, …NOACTIVATE)</code>
+→ <code>BringWindowToTop</code> → <code>SetForegroundWindow</code> → 60ms 后校验 <code>GetForegroundWindow()</code>；
+失败就 <code>FlashWindowEx</code> 让任务栏闪一下，不再重启 DSH，也不再 Attach。
+<code>grep -c AttachThreadInput native/*.cs</code> = 0。</p>
+
+<h3>② 「菜单点了没反应」：鼠标捕获悬挂，点击被宠物窗口吃掉</h3>
+<p>现象：菜单开着，点「打开 DSH」没反应，宠物反而被单击了。现场探针很反直觉——
+<code>WindowFromPoint()</code> 明明返回的是菜单窗口，z 序也对。</p>
+<pre>WM_LBUTTONDOWN: captureBefore=190123676  capture now=190123676  self=190123676</pre>
+<p>宠物窗口在点击<b>之前</b>就已经握着鼠标捕获。持有捕获的窗口会直接收到后续鼠标消息，
+<code>WM_NCHITTEST</code> 根本不会再发出去——所以菜单永远等不到 mouse-up。根因是旧代码在
+每次 <code>WM_LBUTTONDOWN</code> 就 <code>SetCapture</code>，而只在 <code>if (_dragging)</code> 分支里 <code>ReleaseCapture</code>：
+只要有一次 up 丢失，捕获就永久挂住。</p>
+<p><b>三层修法</b>：</p>
+<pre>// 1) 懒捕获：只有真的移动超过 4px 才开始抢鼠标
+if (_dragMoved) Native.SetCapture(Handle);
+
+// 2) 自愈：每 120ms 检查一次，捕获在自己手上但没在拖动就释放
+void ReleaseStaleCapture() { if (!_dragging && Native.GetCapture() == Handle) Native.ReleaseCapture(); }
+
+// 3) 让位：菜单或写作窗开着时，宠物窗口对命中测试直接返回透明
+if ((_menu != null && !_menu.IsDisposed && _menu.Visible) || IsComposing) return (IntPtr)Native.HTTRANSPARENT;</pre>
+<p>实测：<code>menu mouseup at 71,46 button=Left</code> → <code>menu pick open</code> →
+<code>focused DSH window (menu)</code>；再点「气泡显示 → 8 秒」→ 配置 <code>bubbleMs: 8000</code>；
+点「切换宠物 → Boba」→ 精灵热切换 1536×2288。拖动仍然正常（懒捕获不影响拖拽）。</p>
+
+<h3>③ 动作行移到宠物下方 + 去掉最外面的框</h3>
+<p>布局从 <code>[气泡] → 宠物</code> 改成三段：<code>[动作行] → [气泡] → 宠物</code>，动作行是宠物自己的区域，
+不再是浮在气泡上的白胶囊。窗口贴到底边时自动翻到气泡上方：</p>
+<pre>_actionsBelow = area.Bottom - _anchorY >= actionsH + gap + pad;
+ApplyAnchor(): y = _anchorY - _petBottomOffset;   // 始终以宠物底边为锚</pre>
+<p>「最外面的框」就是那枚白胶囊：现在 <code>DrawToolbar</code> 改名 <code>DrawActions</code>，
+每个按钮只画自己的柔和圆底（常态 alpha 214 / 悬停 248 + 1px 投影），图标换成
+Segoe MDL2 Assets 的 <code>\uE70F</code>（铅笔）/ <code>\uE720</code>（麦克风）。
+气泡也去掉常驻 1px 描边，改成三层半透明圆角阴影，只有「结束提醒」态才画暖色/红色描边。</p>
+<p>顺带修掉一个渲染坑：<code>TextRenderingHint</code> 必须是 <code>AntiAliasGridFit</code>。
+分层窗口是逐像素 alpha，ClearType 的次像素彩边会被原样烧进位图（字周围出现蓝红虚影）。</p>
+<p><img src="img/26-actions-below-0.3.png" alt="动作行在宠物下方">
+<img src="img/27-actions-flip-0.3.png" alt="贴底边时动作行翻到上方">
+<img src="img/28-menu-sub-0.3.png" alt="圆角半透明菜单与子菜单"></p>
+
+<h3>④ 不再碰会话历史：<code>config.json</code> 的读写成对加固</h3>
+<table>
+  <tr><th style="width:34%">时机</th><th>动作</th></tr>
+  <tr><td>写之前</td><td>若没有 <code>.bak</code>，把当前值复制成 <code>config.json.bak</code>（首次写盘的原始值）</td></tr>
+  <tr><td>每次写之前</td><td>把当前值复制成 <code>config.json.prev</code>（上一次成功值）</td></tr>
+  <tr><td>写入</td><td><code>config.json.&lt;pid&gt;.tmp</code> + <code>rename</code>（原子替换，不会出现半个文件）</td></tr>
+  <tr><td>读失败</td><td>原文件另存 <code>config.json.corrupt-&lt;ISO&gt;</code>；先试 <code>.bak</code>，再试 <code>.prev</code>；都失败才用默认值，并把过程写进 <code>host.log</code></td></tr>
+  <tr><td>回滚之后</td><td>立刻 <code>_writeRecovered()</code> 把盘上的坏文件改回合法 JSON（跳过 .bak/.prev 轮转，避免污染备份）</td></tr>
+</table>
+<p>爆炸半径：只有 <code>~/.dsh/pets/</code> 下这三个文件。<code>config-store.js</code> 里没有任何指向 DSH 会话库
+（<code>~/.dsh/storages/session_projcache/</code>）的路径。实机演练（把 config.json 截断成非法 JSON）→
+<code>host.log</code> 记下留档路径并从 <code>.bak</code> 恢复，重启后配置、位置、宠物都原样。</p>
+
+<h3>⑤ 长阻塞的观测手段，以及「不是所有 loop lag 都是 bug」</h3>
+<p>宿主：<code>setInterval(2000)</code> 里比对预期节拍，超 1500ms 记 <code>loop lag &lt;n&gt;ms</code>；
+浮层：后台线程每 2s <code>Invoke</code> 心跳，超 1500ms 记 <code>ui stall &lt;n&gt;ms</code>；
+守护：子进程活过 30s 就清零重启计数，另给 <code>/pet restart</code> 手动重拉。</p>
+<p><b>两轮稳态采样</b>：① 0.3s 间隔连续请求 <code>/state</code> 共 700 次（210 秒），<b>没有一次超过 1 秒</b>
+（<code>{"total": 210.1, "spikes": []}</code>）。历史观察到的 8.1s / 6.3s / 5.9s 三条 <code>loop lag</code>
+全部落在 <code>浮层已启动</code> 之后 6–9 秒——浮层刚起来解码 3.5MB 精灵图、Defender 在扫新 exe，
+宿主只是没抢到时间片。稳态不复现，这与「0.2 卡死是 Electron 侧被 AttachThreadInput 拖住」的结论一致：
+真卡死时界面完全不动，而这里只是看门狗抖了几秒。② 1 秒间隔连续 10 分钟共 <b>590 次</b>，
+<code>{"requests": 590, "seconds": 600.5, "spikes": []}</code>，零尖峰；这一轮还跨了一次系统休眠——
+机器睡一夜醒来后浮层进程仍在、<code>/state</code> 立刻有响应、58 个会话缓存 JSON 全部可解析。</p>
+
+<h3>⑥ 这一轮的验收</h3>
+<table>
+  <tr><th style="width:22%">需求</th><th>结论 / 证据</th></tr>
+  <tr><td>卡死根因</td><td><code>AttachThreadInput</code> + relaunch 兜底，两条路径 0.3 全部删除（源码计数 0）</td></tr>
+  <tr><td>不再丢会话</td><td><code>test/config-store.test.mjs</code> 6 个用例 + 实机坏文件演练：留档 → 从 <code>.bak</code> 恢复 → 立刻写回合法 JSON</td></tr>
+  <tr><td>动作行在下方</td><td><code>img/26-actions-below-0.3.png</code>；贴底边翻转 <code>img/27-actions-flip-0.3.png</code></td></tr>
+  <tr><td>去掉外层框</td><td>无白胶囊、无常驻描边；气泡只剩柔和阴影，提醒态才描边</td></tr>
+  <tr><td>菜单可点</td><td><code>menu pick open</code> / <code>menu pick bubbleMs:8000</code> / <code>menu pick pet:boba</code>（<code>img/28-menu-sub-0.3.png</code>）</td></tr>
+  <tr><td>键盘（补充路径）</td><td>菜单不抢焦点，只有它恰好持有焦点时才会收到按键；不当主路径，也没有为此挂全局键盘钩子</td></tr>
+  <tr><td>回归</td><td><code>node --test test/</code> 32 个用例全绿；<code>csc -warn:4</code> 0 警告</td></tr>
+</table>
+
+<h2><span class="num">14</span>第四轮改动：卡死的真根因、外层框、拖动残影、麦克风（0.3.1）</h2>
+
+<p>这一轮用户明确否掉了上一轮"<code>AttachThreadInput</code> 是根因"的结论，要求先在真机复验再改。
+四条按"问题 → 证据 → 改法 → 怎么验证"给结论。</p>
+
+<h3>14.1 卡死：DSH 自己的 HMR 在重建 profile 时同步遍历文件系统</h3>
+
+<p><strong>结论：</strong>不是宠物浮层把 DSH 拖住。阻塞来自 <code>@deepseek-ai/dsh-hmr</code> 的
+<code>reconcileProfile()</code>——插件清单变化时它同步 <code>realpathSync</code>/<code>lstat</code>
+遍历整个 profile 目录树，单次 1.0–1.8 秒，累加到 2.3–8.2 秒。</p>
+
+<table>
+  <tr><th>证据</th><th>内容</th></tr>
+  <tr><td>4 份 CPU profile</td><td><code>lag-2026-11-22T09-14-08-404Z</code> 2287ms、<code>09-15-57-064Z</code> 2578ms、<code>09-16-05-484Z</code> 6355ms、<code>09-28-04-083Z</code> 5034ms</td></tr>
+  <tr><td>inclusive 栈（四份一致）</td><td><code>apply</code> → <code>dsh-hmr/lib/index.js:120</code> → <code>reconcileProfile</code> <code>:1324</code> → <code>mappedDirectories</code> <code>:1432</code> → <code>realSpellings</code> <code>:1445</code> → <code>realpathSync</code> <code>node:fs:2781</code> → <code>lstat</code> 1.0–1.8 s</td></tr>
+  <tr><td>触发条件</td><td><code>refresh()</code>（<code>lib/index.js:852</code>）只在 <code>profile.patchPath</code>、<code>profile.home/cordis.patch.yml</code>、<code>profile.dir/package.json</code> 变化时触发——即"启用/停用/安装插件"和 DSH 启动</td></tr>
+  <tr><td>为什么"随机"</td><td>平时对话、拖拽、写作都不触发；只有动插件才触发，所以感知上像随机</td></tr>
+  <tr><td>对照组</td><td>稳态 240 s / 250 ms 探针 937 次：DSH UI 线程最长 17 ms、<code>/state</code> 最长 862 ms、0 失败</td></tr>
+  <tr><td>对照组 2</td><td>往 <code>~/.dsh/pets/</code>、工作区根、插件包目录写文件 → 全部无 <code>loop lag</code></td></tr>
+  <tr><td>对照组 3</td><td><code>plugin_manager set_bundle</code> 重载 → 必然 3.2–5.5 s 阻塞</td></tr>
+  <tr><td>Windows 事件日志</td><td>同期无 WER Application Error / AppHang ⇒ 进程内挂起，不是崩溃</td></tr>
+</table>
+
+<p>完整分析见 <a href="lag-analysis.md">lag-analysis.md</a>。宿主所有请求路径都没有同步 fs /
+<code>child_process</code>；浮层也不碰 DSH 的进程与线程（0.3 起不再 <code>AttachThreadInput</code>、
+不再 <code>Process.Start</code>）。</p>
+
+<p>顺带修掉两个会加重观感的问题：<code>ComposeWindow</code> 构造里 <code>BeginInvoke</code> 早于句柄
+（正是"点麦克风没反应"）；DSH 卡住时气泡停在旧内容，现在连续 4 次轮询失败就显示
+<code>DSH 已断开，重连中…</code>。</p>
+
+<p><strong>DSH 侧才能真正消除：</strong>profile 目录改非符号链接布局，或把 <code>~/.dsh/profiles</code>
+加进 Defender 排除；<code>dsh-hmr</code> 的遍历改成异步/增量后这个卡顿就不存在了。</p>
+
+<h3>14.2 最外面的框：不是窗口边框，是气泡的阴影 + 描边</h3>
+
+<p>窗口本身 <code>style=0x16010000</code>（<code>caption=False border=False thick=False</code>）、
+<code>ex=0x08090088</code>，沿窗口下边界内外像素差 <strong>0</strong>——没有窗口边框，
+也没有矩形填充。用户看到的"框"是气泡外面那圈三层圆角阴影加 1px 常驻描边。</p>
+
+<p>改法：删掉阴影栈与常驻描边，气泡改单层扁平半透明填充；提醒态靠填充色 + <code>✔/✕</code> 区分。
+另外把文字渲染从 <code>ClearTypeGridFit</code> 换成 <code>AntiAliasGridFit</code>——分层窗口逐像素 alpha，
+子像素抗锯齿会把彩边烧进位图。</p>
+
+<figure>
+  <img src="img/34-frame-compare-0.3.1.png" alt="0.3.0 与 0.3.1 气泡对比">
+  <figcaption>左：0.3.0（三层阴影 + 1px 描边）　右：0.3.1（扁平填充、无框）。同位置同尺寸。</figcaption>
+</figure>
+
+<h3>14.3 拖动残影：位置变了但合成帧没跟着推</h3>
+
+<p>拖动分支只改 <code>Location</code>，<code>PushLayered()</code> 还等 80 ms 的动画定时器，
+窗口挪走后屏幕上留下的是上一次 <code>UpdateLayeredWindow</code> 的内容。修法：
+<code>Location = ClampWindow(...)</code> 之后立刻补推一帧，8 ms 节流（<code>_dragPushAt</code>），
+松手再 <code>Relayout</code>。</p>
+
+<p>验证工具 <code>tools/ghostcheck.py</code>：先用干净基准图对连拍帧做分块统计，200 帧里单帧最多 2 块
+（气泡 + 宠物，正常形态），没有出现第三块；松手 1.5 秒后的画面与基准<strong>逐像素一致</strong>
+（<code>bbox=None</code>，最大通道差 0）。</p>
+
+<figure>
+  <img src="img/35-drag-no-residue-0.3.1.png" alt="拖动残影检测">
+  <figcaption>① 拖到该区域　② 拖走后截干净基准　③ 松手 1.5s 后实测：与②逐像素一致。</figcaption>
+</figure>
+
+<h3>14.4 麦克风点了没反应：<code>BeginInvoke</code> 早于窗口句柄</h3>
+
+<p><code>overlay.log</code> 里 8 次
+<code>InvalidOperationException: 在创建窗口句柄之前，不能在控件上调用 Invoke 或 BeginInvoke。</code>，
+栈是 <code>ComposeWindow..ctor ← PetForm.OpenCompose ← PetForm.WndProc</code>——正是点 🎤 的路径。
+改法：构造里只记 <code>_voicePending</code>，<code>ToggleVoice()</code> 挪到 <code>OnShown</code>；
+语音不可用时按钮变灰并给红字原因。</p>
+
+<figure>
+  <img src="img/36-mic-compose-0.3.1.png" alt="点击麦克风后进入录音态">
+  <figcaption>点 🎤 → 写作窗正常弹出，按钮文案变「停止」（已进入录音）。</figcaption>
+</figure>
+
+<h3>14.5 新增的取证工具</h3>
+
+<p><code>src/profiler.js</code>（<code>DSH_PET_PROFILE=1</code> 或 <code>~/.dsh/pets/profile.on</code> 时启用）：
+<code>monitorEventLoopDelay</code> 20 ms 采样 + <code>setTimeout</code> 心跳，单次阻塞超过 1500 ms 就停表写
+<code>lag-&lt;ISO&gt;.cpuprofile</code> 并打印 <code>loop block &lt;n&gt;ms profile=… top=&lt;函数@文件:行&gt;</code>。
+V8 采样线程独立于事件循环，所以"卡死那几秒"的栈也能被记下来。
+<code>tools/probe.ps1</code> 用 <code>SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG)</code> 分别量
+DSH 主窗口与浮层窗口的 UI 响应并叠一个 <code>/state</code> 时延写 CSV；
+<code>tools/soak.ps1</code> 按固定序列跑长跑。</p>
+
+<h3>14.6 验收</h3>
+
+<table>
+  <tr><th>需求</th><th>结论 / 证据</th></tr>
+  <tr><td>① 卡死根因</td><td><code>dsh-hmr</code> <code>reconcileProfile</code> 同步遍历；4 份 profile 栈一致；对照 937 次探针最长 17 ms</td></tr>
+  <tr><td>② 外层框</td><td>窗口无边框（样式 + 像素双验证）；删阴影/描边后 32/33/34 三张对比图</td></tr>
+  <tr><td>③ 拖动残影</td><td>位置更新后 8 ms 内补推一帧；200 帧无第三块、松手逐像素一致（35）</td></tr>
+  <tr><td>④ 麦克风</td><td>8 次 <code>InvalidOperationException</code> → 改 <code>OnShown</code> 启动；36 可见录音态</td></tr>
+  <tr><td>回归</td><td><code>node --test test/</code> 35 个用例全绿；<code>csc -warn:4</code> 0 警告</td></tr>
+  <tr><td>最小化可用</td><td>DSH <code>iconic=True</code> 时宠物与气泡照常（<code>37-minimized-alert-0.3.1.png</code> / <code>38-pet-minimized-0.3.1.png</code>）</td></tr>
+  <tr><td>会话不丢</td><td>只读会话目录；配置改动走 <code>.bak</code>/<code>.prev</code>/坏文件留档</td></tr>
+</table>
+
 <footer>
   dsh-pet · 交付物：<code>docs/DESIGN.md</code>（本文 Markdown 版）、<code>README.md</code>（安装/使用/验收）、<code>src/</code>（宿主插件）、<code>native/</code>（C# 浮层）、<code>test/</code>（回归）。
 </footer>

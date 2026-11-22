@@ -214,6 +214,7 @@ export class OverlaySupervisor {
       detached: false,
     });
     this.child = child;
+    this.startedAt = Date.now();
     this.state = 'running';
     this.log(`浮层已启动 pid=${child.pid} host=${this.host}`);
 
@@ -225,8 +226,12 @@ export class OverlaySupervisor {
     });
 
     child.on('exit', (code, signal) => {
+      const lived = this.startedAt ? Date.now() - this.startedAt : 0;
       this.child = null;
-      this.log(`浮层退出 code=${code} signal=${signal ?? ''}`);
+      this.startedAt = 0;
+      // 稳定跑过 30 秒再掉线，不算「连续重启」——否则一整天里偶发两三次退出就会把配额耗尽
+      if (lived > 30_000) this.restarts = 0;
+      this.log(`浮层退出 code=${code} signal=${signal ?? ''}（存活 ${Math.round(lived / 1000)}s）`);
       if (this.stopping) {
         this.state = 'stopped';
         return;
@@ -250,6 +255,18 @@ export class OverlaySupervisor {
       }, 1500);
       this.timer.unref?.();
     });
+  }
+
+  /**
+   * 手动重启（/pet restart 用）：清空连续重启计数，再拉一次。
+   */
+  async restart() {
+    await this.stop();
+    this.restarts = 0;
+    this.lastError = '';
+    this.state = 'stopped';
+    await this.start();
+    return this.status();
   }
 
   async stop() {

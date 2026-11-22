@@ -104,6 +104,19 @@ export function serializeState(snapshot) {
   return lines.join('\n');
 }
 
+function line(key, value) {
+  return `${key}=${encodeURIComponent(value.toWellFormed())}`;
+}
+
+function serializeTargets({ preferredId, targets }) {
+  const lines = [];
+  if (preferredId) lines.push(line('preferredId', preferredId));
+  targets.forEach(({ id, title }, index) => {
+    lines.push(line(`target.${index}.id`, id), line(`target.${index}.title`, title));
+  });
+  return lines.join('\n');
+}
+
 export class PetHttpApi {
   /**
    * @param {object} options
@@ -171,12 +184,33 @@ export class PetHttpApi {
         send(res, 200, 'ok');
         return;
       }
-      if (req.method === 'POST' && endpoint === 'say') {
-        const body = parseBody(await readBody(req), req.headers['content-type'] ?? '');
-        const result = await this.service.say(String(body.text ?? ''));
-        send(res, 200, result);
+      if (req.method === 'GET' && endpoint === 'compose-targets') {
+        try {
+          const targets = await this.service.compose.targets();
+          send(res, 200, serializeTargets(targets));
+        } catch {
+          this.log('浮层会话列表暂不可用');
+          send(res, 503, 'session list unavailable');
+        }
         return;
       }
+      if (req.method === 'POST' && endpoint === 'say') {
+        const body = parseBody(await readBody(req), req.headers['content-type'] ?? '');
+        const { status, message } = await this.service.compose.submit(body);
+        send(res, 200, [line('status', status), line('message', message)].join('\n'));
+        return;
+      }
+      if (req.method === 'POST' && endpoint === 'queue') {
+        send(res, 200, String(await this.service.clearQueue()));
+        return;
+      }
+
+      if (req.method === 'POST' && endpoint === 'profile') {
+        const body = await readBody(req);
+        send(res, 200, String(await this.service.profile(body)));
+        return;
+      }
+
       if (req.method === 'POST' && endpoint === 'test') {
         const body = parseBody(await readBody(req), req.headers['content-type'] ?? '');
         this.service.test(body.kind);

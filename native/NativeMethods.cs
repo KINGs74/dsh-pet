@@ -5,9 +5,11 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using Microsoft.Win32;
 
 namespace DshPet
 {
@@ -21,6 +23,8 @@ namespace DshPet
 
         public const int WM_NCHITTEST = 0x0084;
         public const int WM_MOUSEACTIVATE = 0x0021;
+        public const int WM_CANCELMODE = 0x001F;
+        public const int WM_CAPTURECHANGED = 0x0215;
         public const int WM_LBUTTONDOWN = 0x0201;
         public const int WM_LBUTTONUP = 0x0202;
         public const int WM_MOUSEMOVE = 0x0200;
@@ -33,15 +37,30 @@ namespace DshPet
         public const int HTCLIENT = 1;
         public const int MA_NOACTIVATE = 3;
 
-        public const int SW_HIDE = 0;
-        public const int SW_SHOWNORMAL = 1;
-        public const int SW_SHOWMINIMIZED = 2;
-        public const int SW_SHOW = 5;
-        public const int SW_RESTORE = 9;
 
         public const int ULW_ALPHA = 2;
 
+        const int GWL_STYLE = -16;
+        const int GWL_EXSTYLE = -20;
+        const int WS_THICKFRAME = 0x00040000;
+        const uint GW_OWNER = 4;
+        const uint FLASHW_ALL = 3;
+        const int SM_SWAPBUTTON = 23;
+        const int VK_LBUTTON = 0x01;
+        const int VK_RBUTTON = 0x02;
+        const int VK_MBUTTON = 0x04;
+
         public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct FLASHWINFO
+        {
+            public uint cbSize;
+            public IntPtr hwnd;
+            public uint dwFlags;
+            public uint uCount;
+            public uint dwTimeout;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT
@@ -118,14 +137,30 @@ namespace DshPet
             out IntPtr ppvBits, IntPtr hSection, uint dwOffset);
 
         [DllImport("user32.dll")] public static extern IntPtr SetCapture(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern IntPtr GetCapture();
+
         [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int virtualKey);
+        [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+
+        public static bool IsPrimaryMouseButtonDown()
+        {
+            int button = GetSystemMetrics(SM_SWAPBUTTON) != 0 ? VK_RBUTTON : VK_LBUTTON;
+            return GetAsyncKeyState(button) < 0;
+        }
+
+        public static int PressedMouseButtons()
+        {
+            return (GetAsyncKeyState(VK_LBUTTON) < 0 ? 1 : 0)
+                | (GetAsyncKeyState(VK_RBUTTON) < 0 ? 2 : 0)
+                | (GetAsyncKeyState(VK_MBUTTON) < 0 ? 4 : 0);
+        }
 
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool IsHungAppWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
@@ -136,8 +171,13 @@ namespace DshPet
         [DllImport("user32.dll")]
         public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
-        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder name, int count);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", ExactSpelling = true)] static extern int GetWindowStyle(IntPtr hWnd, int index);
+        [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint command);
+
+        [DllImport("user32.dll")]
+        public static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
+
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -167,64 +207,140 @@ namespace DshPet
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool GetExitCodeProcess(IntPtr hProcess, out int lpExitCode);
 
-        /// <summary>
-        /// 在指定进程的顶层窗口里找一个"主窗口"。关键点：**不要求 IsWindowVisible**，
-        /// 因为 DSH 被关闭到托盘时窗口是 hide() 状态，旧实现就是在这一步把窗口漏掉，
-        /// 于是"打开 DSH"静默失败（overlay.log 里 23 次 DSH window not found）。
-        /// </summary>
+        static bool BelongsToProcess(IntPtr hwnd, int pid)
+        {
+            uint actualPid;
+            return GetWindowThreadProcessId(hwnd, out actualPid) != 0 && actualPid == (uint)pid;
+        }
+
         public static IntPtr FindMainWindow(int pid)
         {
             IntPtr best = IntPtr.Zero;
             int bestScore = -1;
-            EnumWindowsProc callback = delegate(IntPtr hWnd, IntPtr lParam)
+            StringBuilder windowClass = new StringBuilder(64);
+            StringBuilder title = new StringBuilder(512);
+            EnumWindows(delegate(IntPtr hwnd, IntPtr ignored)
             {
-                uint owner;
-                GetWindowThreadProcessId(hWnd, out owner);
-                if (owner == 0 || (int)owner != pid) return true;
-                StringBuilder title = new StringBuilder(512);
-                GetWindowText(hWnd, title, title.Capacity);
-                bool visible = IsWindowVisible(hWnd);
-                int score = 0;
-                if (title.Length > 0) score += 10;
-                if (visible) score += 5;
-                if (!IsIconic(hWnd)) score += 2;
+                if (!BelongsToProcess(hwnd, pid) || GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
+                int extendedStyle = GetWindowStyle(hwnd, GWL_EXSTYLE);
+                if ((extendedStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0) return true;
+                if (GetClassName(hwnd, windowClass, windowClass.Capacity) == 0
+                    || !string.Equals(windowClass.ToString(), "Chrome_WidgetWin_1", StringComparison.Ordinal)) return true;
+                if (GetWindowText(hwnd, title, title.Capacity) == 0) return true;
+
+                string caption = title.ToString();
+                if (caption.StartsWith("DevTools", StringComparison.OrdinalIgnoreCase)) return true;
+                bool productTitle = caption.Equals("DeepSeek Harness", StringComparison.OrdinalIgnoreCase)
+                    || caption.Equals("DSH", StringComparison.OrdinalIgnoreCase)
+                    || caption.EndsWith(" — DeepSeek Harness", StringComparison.OrdinalIgnoreCase)
+                    || caption.EndsWith(" - DeepSeek Harness", StringComparison.OrdinalIgnoreCase);
+                if (!productTitle && (GetWindowStyle(hwnd, GWL_STYLE) & WS_THICKFRAME) == 0) return true;
+
+                int score = (productTitle ? 8 : 0) + (IsWindowVisible(hwnd) ? 2 : 0);
                 if (score > bestScore)
                 {
                     bestScore = score;
-                    best = hWnd;
+                    best = hwnd;
                 }
                 return true;
-            };
-            EnumWindows(callback, IntPtr.Zero);
+            }, IntPtr.Zero);
             return best;
         }
 
-        /// <summary>把窗口显示出来并抢到前台。AttachThreadInput 是绕开前台锁的常规做法。</summary>
-        public static bool RevealAndFocus(IntPtr hWnd)
+        // dsh://open is registered by the desktop app. Its Windows secondary instance exits
+        // at the Electron single-instance lock, handing restore/show/focus to the owner.
+        public static bool RequestDshOpen(IntPtr hwnd, int pid, out string result)
         {
-            if (hWnd == IntPtr.Zero || !IsWindow(hWnd)) return false;
-            if (!IsWindowVisible(hWnd)) ShowWindow(hWnd, SW_SHOW);
-            if (IsIconic(hWnd)) ShowWindow(hWnd, SW_RESTORE);
-            ShowWindow(hWnd, SW_SHOWNORMAL);
-
-            for (int attempt = 0; attempt < 3; attempt++)
+            if (!BelongsToProcess(hwnd, pid))
             {
-                IntPtr foreground = GetForegroundWindow();
-                if (foreground == hWnd) return true;
-                uint foregroundThread = 0;
-                if (foreground != IntPtr.Zero) GetWindowThreadProcessId(foreground, out foregroundThread);
-                uint myThread = GetCurrentThreadId();
-                bool attached = false;
-                if (foregroundThread != 0 && foregroundThread != myThread)
-                {
-                    attached = AttachThreadInput(myThread, foregroundThread, true);
-                }
-                bool ok = SetForegroundWindow(hWnd);
-                if (attached) AttachThreadInput(myThread, foregroundThread, false);
-                if (ok || GetForegroundWindow() == hWnd) return true;
-                Thread.Sleep(80);
+                result = "DSH window unavailable";
+                return false;
             }
-            return GetForegroundWindow() == hWnd;
+            if (IsHungAppWindow(hwnd))
+            {
+                result = "DSH window is not responding";
+                return false;
+            }
+
+            string executable;
+            using (Process current = Process.GetProcessById(pid))
+            {
+                executable = current.MainModule.FileName;
+            }
+            string registered = Registry.GetValue(
+                @"HKEY_CLASSES_ROOT\dsh\shell\open\command", "", null) as string;
+            if (!IsDshProtocolHandler(registered, executable))
+            {
+                result = "DSH protocol handler does not match the running app";
+                Flash(hwnd);
+                return false;
+            }
+
+            ProcessStartInfo start = new ProcessStartInfo(executable, "dsh://open");
+            start.WorkingDirectory = Path.GetDirectoryName(executable);
+            start.UseShellExecute = false;
+            // The overlay may have inherited this from the DSH Node host.
+            start.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE");
+            if (!BelongsToProcess(hwnd, pid))
+            {
+                result = "DSH window closed before handoff";
+                return false;
+            }
+
+            using (Process handoff = Process.Start(start))
+            {
+                if (handoff == null)
+                {
+                    result = "could not start DSH protocol handoff";
+                    return false;
+                }
+                // Wait for the short-lived instance to dispatch to the existing desktop app.
+                if (!handoff.WaitForExit(1500))
+                {
+                    result = "DSH protocol handoff did not finish";
+                    Flash(hwnd);
+                    return false;
+                }
+                if (handoff.ExitCode != 0)
+                {
+                    result = "DSH protocol handoff exited with code " + handoff.ExitCode;
+                    Flash(hwnd);
+                    return false;
+                }
+            }
+
+            Stopwatch wait = Stopwatch.StartNew();
+            while (wait.ElapsedMilliseconds < 800 && BelongsToProcess(hwnd, pid))
+            {
+                if (GetForegroundWindow() == hwnd && IsWindowVisible(hwnd) && !IsIconic(hwnd))
+                {
+                    result = "DSH handoff completed; window foreground";
+                    return true;
+                }
+                Thread.Sleep(40);
+            }
+            result = "DSH handoff completed; foreground not observed";
+            if (BelongsToProcess(hwnd, pid)) Flash(hwnd);
+            return false;
+        }
+
+        internal static bool IsDshProtocolHandler(string command, string executable)
+        {
+            return !String.IsNullOrWhiteSpace(executable) && command != null &&
+                String.Equals(command.Trim(), "\"" + executable + "\" \"%1\"", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>任务栏闪烁提示（非阻塞，纯提示）。</summary>
+        public static void Flash(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero || !IsWindow(hWnd)) return;
+            FLASHWINFO info = new FLASHWINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(FLASHWINFO));
+            info.hwnd = hWnd;
+            info.dwFlags = FLASHW_ALL;
+            info.uCount = 3;
+            info.dwTimeout = 0;
+            FlashWindowEx(ref info);
         }
     }
 }

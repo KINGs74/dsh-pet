@@ -1,7 +1,4 @@
-// dsh-pet · 语音输入（System.Speech）
-//
-// 编译时用 /define:VOICE 打开；拿不到 System.Speech.dll 的机器上会退化成"不可用"，
-// 点麦克风只会弹一句提示，不影响别的功能。
+// dsh-pet · Windows 本地语音听写
 using System;
 #if VOICE
 using System.Speech.Recognition;
@@ -9,179 +6,122 @@ using System.Speech.Recognition;
 
 namespace DshPet
 {
+    // One recognizer per recording. Start, stop and disposal run off the UI thread.
     sealed class VoiceInput : IDisposable
     {
+        readonly bool _english;
+#if VOICE
+        readonly object _gate = new object();
+        SpeechRecognitionEngine _engine;
+        bool _disposed;
+#endif
+
         public event Action<string> Partial;
         public event Action<string> Final;
-        public event Action<string> Failed;
+        public event Action<string> Completed;
 
-#if VOICE
-        SpeechRecognitionEngine _engine;
-        bool _recording;
-        string _pendingReason = "";
-#endif
-
-        public bool Available
+        public VoiceInput(bool english)
         {
-            get
-            {
-#if VOICE
-                try
-                {
-                    return SpeechRecognitionEngine.InstalledRecognizers().Count > 0;
-                }
-                catch
-                {
-                    return false;
-                }
-#else
-                return false;
-#endif
-            }
+            _english = english;
         }
 
-        public string UnavailableReason
+        string Localize(string chinese, string english)
         {
-            get
-            {
+            return _english ? english : chinese;
+        }
+
+        public string Start()
+        {
 #if VOICE
-                try
+            lock (_gate)
+            {
+                if (_disposed) return "";
+                var recognizers = SpeechRecognitionEngine.InstalledRecognizers();
+                if (recognizers.Count == 0)
+                    throw new InvalidOperationException(Localize(
+                        "Windows 没有安装可用的听写引擎。", "Windows has no compatible dictation recognizer."));
+
+                string preferred = _english ? "en" : "zh";
+                RecognizerInfo chosen = recognizers[0];
+                foreach (RecognizerInfo recognizer in recognizers)
                 {
-                    if (SpeechRecognitionEngine.InstalledRecognizers().Count == 0)
+                    if (recognizer.Culture.TwoLetterISOLanguageName == preferred)
                     {
-                        return "Windows 里没有安装语音识别引擎，无法语音输入。";
+                        chosen = recognizer;
+                        break;
                     }
                 }
-                catch
+
+                _engine = new SpeechRecognitionEngine(chosen);
+                _engine.LoadGrammar(new DictationGrammar());
+                try { _engine.SetInputToDefaultAudioDevice(); }
+                catch (Exception)
                 {
+                    throw new InvalidOperationException(Localize(
+                        "请检查 Windows 麦克风权限和默认录音设备。",
+                        "Check Windows microphone access and the default recording device."));
                 }
-                return _pendingReason.Length > 0 ? _pendingReason : "语音输入暂时不可用。";
-#else
-                return "这版浮层没有编译语音模块（缺少 System.Speech），请用文字输入。";
-#endif
-            }
-        }
 
-        public bool Recording
-        {
-            get
-            {
-#if VOICE
-                return _recording;
-#else
-                return false;
-#endif
-            }
-        }
-
-        public void Reset()
-        {
-#if VOICE
-            _pendingReason = "";
-#endif
-        }
-
-        public void Start()
-        {
-#if VOICE
-            if (_recording) return;
-            try
-            {
-                if (_engine == null) _engine = CreateEngine();
-                if (_engine == null)
+                _engine.SpeechHypothesized += delegate(object sender, SpeechHypothesizedEventArgs args)
                 {
-                    _pendingReason = "语音引擎创建失败。";
-                    Raise(Failed, _pendingReason);
-                    return;
-                }
+                    if (args.Result != null) Raise(Partial, args.Result.Text);
+                };
+                _engine.SpeechRecognized += delegate(object sender, SpeechRecognizedEventArgs args)
+                {
+                    if (args.Result != null && !String.IsNullOrWhiteSpace(args.Result.Text))
+                        Raise(Final, args.Result.Text.Trim());
+                };
+                _engine.RecognizeCompleted += delegate(object sender, RecognizeCompletedEventArgs args)
+                {
+                    string error = args.Error == null ? "" :
+                        Localize("听写中断：", "Dictation interrupted: ") + args.Error.Message;
+                    Raise(Completed, error);
+                };
                 _engine.RecognizeAsync(RecognizeMode.Multiple);
-                _recording = true;
-            }
-            catch (Exception error)
-            {
-                _pendingReason = "启动语音识别失败：" + error.Message;
-                Raise(Failed, _pendingReason);
+                return _english ? chosen.Culture.EnglishName : chosen.Culture.NativeName;
             }
 #else
-            Raise(Failed, UnavailableReason);
+            throw new InvalidOperationException(Localize(
+                "此版本未编译语音模块，请使用文字输入。",
+                "This build has no speech support. You can still type."));
 #endif
         }
 
         public void Stop()
         {
 #if VOICE
-            if (!_recording) return;
-            _recording = false;
-            try
+            lock (_gate)
             {
-                if (_engine != null) _engine.RecognizeAsyncCancel();
-            }
-            catch
-            {
+                if (!_disposed && _engine != null) _engine.RecognizeAsyncStop();
             }
 #endif
         }
 
 #if VOICE
-        SpeechRecognitionEngine CreateEngine()
+        static void Raise(Action<string> handler, string text)
         {
-            System.Collections.Generic.IReadOnlyList<RecognizerInfo> infos = SpeechRecognitionEngine.InstalledRecognizers();
-            if (infos == null || infos.Count == 0) return null;
-            RecognizerInfo chosen = infos[0];
-            for (int i = 0; i < infos.Count; i++)
-            {
-                if (infos[i].Culture.Name.StartsWith("zh", StringComparison.OrdinalIgnoreCase))
-                {
-                    chosen = infos[i];
-                    break;
-                }
-            }
-            SpeechRecognitionEngine engine = new SpeechRecognitionEngine(chosen);
-            engine.LoadGrammar(new DictationGrammar());
-            engine.SetInputToDefaultAudioDevice();
-            engine.SpeechHypothesized += delegate(object sender, SpeechHypothesizedEventArgs args)
-            {
-                if (!_recording || args.Result == null) return;
-                Raise(Partial, args.Result.Text);
-            };
-            engine.SpeechRecognized += delegate(object sender, SpeechRecognizedEventArgs args)
-            {
-                if (!_recording || args.Result == null) return;
-                string text = args.Result.Text;
-                if (text == null || text.Trim().Length == 0) return;
-                Raise(Final, text.Trim());
-            };
-            engine.RecognizeCompleted += delegate(object sender, RecognizeCompletedEventArgs args)
-            {
-                if (args.Error != null && _recording)
-                {
-                    _pendingReason = "识别中断：" + args.Error.Message;
-                    Raise(Failed, _pendingReason);
-                }
-            };
-            return engine;
+            if (handler != null) handler(text ?? "");
         }
 #endif
-
-        void Raise(Action<string> handler, string text)
-        {
-            if (handler != null) handler(text);
-        }
 
         public void Dispose()
         {
 #if VOICE
-            Stop();
-            if (_engine != null)
+            SpeechRecognitionEngine engine;
+            lock (_gate)
             {
-                try
-                {
-                    _engine.Dispose();
-                }
-                catch
-                {
-                }
+                if (_disposed) return;
+                _disposed = true;
+                engine = _engine;
                 _engine = null;
+            }
+            if (engine == null) return;
+            try { engine.RecognizeAsyncCancel(); }
+            catch (InvalidOperationException) { }
+            finally
+            {
+                try { engine.Dispose(); }
+                catch (InvalidOperationException) { }
             }
 #endif
         }

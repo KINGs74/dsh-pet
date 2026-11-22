@@ -20,8 +20,10 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace DshPet
@@ -55,6 +57,7 @@ namespace DshPet
         // —— 交互状态 ——
         bool _dragging;
         bool _dragMoved;
+        long _dragPushAt;
         Point _dragStartScreen;
         Point _dragStartWindow;
         bool _hover;
@@ -62,9 +65,14 @@ namespace DshPet
         int _hoverButton;
         Point _lastMouse;
 
-        Rectangle _toolbarRect;
-        Rectangle _btnCompose;
-        Rectangle _btnVoice;
+        // 动作条（✎/🎤）单独一行、宠物下方、没有容器；这三个矩形都由 Relayout 算
+        Rectangle _actionsRect = Rectangle.Empty;
+        Rectangle _btnCompose = Rectangle.Empty;
+        Rectangle _btnVoice = Rectangle.Empty;
+        Rectangle _bubbleRect = Rectangle.Empty;
+        Rectangle _petRect = Rectangle.Empty;
+        int _petBottomOffset;   // 宠物底边在窗口内的高度，锚点靠它保持"脚不动"
+        bool _actionsBelow = true;
 
         // —— 气泡计时 ——
         DateTime _contentAt = DateTime.UtcNow;
@@ -76,21 +84,26 @@ namespace DshPet
         // —— 连接与生命周期 ——
         bool _connectedOnce;
         int _failures;
-        bool _closing;
+        volatile bool _closing;
         int _dshPid;
-        string _dshExe = "";
+        bool _focusPending;
+        bool _focusRequested;
+        int _lastFocusAt;
+        DateTime _focusHintUntil;
 
         // —— 位置锚点（宠物底边中点，屏幕物理像素）——
         int _anchorX = int.MinValue;
         int _anchorY = int.MinValue;
-        bool _anchorFromServer;
+        // 服务端上一次下发的锚点：只要它变了（比如 /pet 或别的入口改了配置），就把宠物挪过去
+        int _serverPosX = int.MinValue;
+        int _serverPosY = int.MinValue;
 
         float _dpi = 1f;
 
         readonly Font _titleFont;
         readonly Font _bodyFont;
         readonly Font _smallFont;
-        readonly Font _glyphFont;
+        readonly Font _iconFont;
         readonly Graphics _measure;
 
         System.Windows.Forms.Timer _animTimer;
@@ -98,13 +111,11 @@ namespace DshPet
 
         OverlayMenu _menu;
         ComposeWindow _composeWindow;
-        bool _composeVoice;
 
         public PetForm(Opts opts)
         {
             _opts = opts;
             _dshPid = opts.DshPid;
-            _dshExe = opts.DshExe ?? "";
 
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -123,7 +134,7 @@ namespace DshPet
             _titleFont = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold, GraphicsUnit.Point);
             _bodyFont = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point);
             _smallFont = new Font("Microsoft YaHei UI", 8f, FontStyle.Regular, GraphicsUnit.Point);
-            _glyphFont = new Font("Segoe UI Symbol", 10f, FontStyle.Regular, GraphicsUnit.Point);
+            _iconFont = new Font("Segoe MDL2 Assets", 11f, FontStyle.Regular, GraphicsUnit.Point);
 
             _animTimer = new System.Windows.Forms.Timer();
             _animTimer.Interval = 80;
@@ -138,8 +149,16 @@ namespace DshPet
                 _animTimer.Start();
                 _hoverTimer.Start();
                 StartPolling();
+                StartStallWatchdog();
             };
-            FormClosing += delegate { _closing = true; _animTimer.Stop(); _hoverTimer.Stop(); };
+            FormClosing += delegate
+            {
+                _closing = true;
+                _animTimer.Stop();
+                _hoverTimer.Stop();
+                if (IsComposing) _composeWindow.CloseForShutdown();
+                CloseMenu();
+            };
         }
 
         protected override bool ShowWithoutActivation
@@ -165,6 +184,11 @@ namespace DshPet
             return (int)Math.Round(value * _dpi);
         }
 
+        float S(float value)
+        {
+            return (float)(value * _dpi);
+        }
+
         int PetW { get { return Math.Max(32, (int)Math.Round(_state.FrameW * _state.Scale)); } }
         int PetH { get { return Math.Max(32, (int)Math.Round(_state.FrameH * _state.Scale)); } }
         int BubbleW { get { return S(300); } }
@@ -184,8 +208,11 @@ namespace DshPet
             return _state.Lang == "en" ? en : zh;
         }
 
+        bool FocusHintVisible { get { return DateTime.UtcNow < _focusHintUntil; } }
+
         bool BubbleVisible()
         {
+            if (FocusHintVisible) return true;
             if (!_state.Bubble) return false;
             DateTime now = DateTime.UtcNow;
             if (_state.AlertId.Length > 0)
@@ -206,21 +233,72 @@ namespace DshPet
         void Relayout(bool force)
         {
             bool showBubble = BubbleVisible();
-            bool showToolbar = HoverVisible;
+            bool showActions = HoverVisible;
             int pad = S(6);
             int gap = S(6);
             int petW = PetW;
             int petH = PetH;
-            int toolbarW = S(78);
-            int toolbarH = S(34);
+            int actionsW = S(72);
+            int actionsH = S(30);
             int bubbleW = showBubble ? Math.Min(BubbleW, Math.Max(petW, S(210))) : 0;
             int bubbleH = showBubble ? MeasureBubble(bubbleW) : 0;
 
-            int winW = Math.Max(Math.Max(petW, bubbleW), showToolbar ? toolbarW : 0) + pad * 2;
-            int winH = (showToolbar ? toolbarH + gap : 0) + (showBubble ? bubbleH + gap : 0) + petH + pad * 2;
+            // 动作条默认在宠物下方的独立一行；宠物贴着屏幕底边放不下时翻到最上面（气泡之上），
+            // 这样贴边时按钮也不会被裁掉。
+            _actionsBelow = true;
+            if (showActions)
+            {
+                Point anchorPoint = new Point(_anchorX == int.MinValue ? 0 : _anchorX, _anchorY == int.MinValue ? 0 : _anchorY);
+                Screen screen = Screen.FromPoint(anchorPoint);
+                Rectangle area = screen != null ? screen.WorkingArea : Screen.PrimaryScreen.WorkingArea;
+                _actionsBelow = _anchorY == int.MinValue || area.Bottom - _anchorY >= actionsH + gap + pad;
+            }
 
+            int contentW = Math.Max(Math.Max(petW, bubbleW), showActions ? actionsW : 0);
+            int winW = contentW + pad * 2;
+
+            int y = pad;
+            if (showActions && !_actionsBelow)
+            {
+                _actionsRect = new Rectangle((winW - actionsW) / 2, y, actionsW, actionsH);
+                y += actionsH + gap;
+            }
+            else
+            {
+                _actionsRect = Rectangle.Empty;
+            }
+
+            if (showBubble)
+            {
+                _bubbleRect = new Rectangle((winW - bubbleW) / 2, y, bubbleW, bubbleH);
+                y += bubbleH + gap;
+            }
+            else
+            {
+                _bubbleRect = Rectangle.Empty;
+            }
+
+            _petRect = new Rectangle((winW - petW) / 2, y, petW, petH);
+            y += petH;
+
+            if (showActions && _actionsBelow)
+            {
+                y += gap;
+                _actionsRect = new Rectangle((winW - actionsW) / 2, y, actionsW, actionsH);
+                y += actionsH;
+            }
+
+            int winH = y + pad;
             if (winW < S(80)) winW = S(80);
-            if (winH < petH + pad * 2) winH = petH + pad * 2;
+
+            // 两个按钮各 30×30，居中排在动作条里，中间留 10px —— 彼此分开，没有整体容器。
+            int btn = S(30);
+            int buttonsW = btn * 2 + S(10);
+            int left = _actionsRect.X + Math.Max(0, (_actionsRect.Width - buttonsW) / 2);
+            _btnCompose = new Rectangle(left, _actionsRect.Y, btn, actionsH);
+            _btnVoice = new Rectangle(left + btn + S(10), _actionsRect.Y, btn, actionsH);
+
+            _petBottomOffset = _petRect.Bottom;
 
             bool sizeChanged = winW != Width || winH != Height;
             if (sizeChanged || force)
@@ -228,10 +306,6 @@ namespace DshPet
                 ResizeCompose(winW, winH);
                 Size = new Size(winW, winH);
             }
-
-            _toolbarRect = new Rectangle((winW - toolbarW) / 2, pad, toolbarW, toolbarH);
-            _btnCompose = new Rectangle(_toolbarRect.X + S(6), _toolbarRect.Y + S(4), S(30), S(26));
-            _btnVoice = new Rectangle(_toolbarRect.X + toolbarW - S(36), _toolbarRect.Y + S(4), S(30), S(26));
 
             ApplyAnchor(winW, winH);
             Render();
@@ -245,9 +319,8 @@ namespace DshPet
                 _anchorX = area.Right - S(140);
                 _anchorY = area.Bottom - S(28);
             }
-            int pad = S(6);
             int x = _anchorX - winW / 2;
-            int y = _anchorY + pad - winH;
+            int y = _anchorY - _petBottomOffset;
             Point target = ClampWindow(new Point(x, y), winW, winH);
             if (Location != target) Location = target;
         }
@@ -275,12 +348,6 @@ namespace DshPet
             int padX = S(12);
             int padY = S(9);
             int inner = width - padX * 2;
-            string title = _state.AlertId.Length > 0
-                ? Localized("任务已经结束", "Task finished")
-                : _state.Title;
-            if (_state.AlertId.Length > 0 && !_state.IsSuccess) title = Localized("任务执行失败", "Task failed");
-            if (_state.Toast.Length > 0 && _state.AlertId.Length == 0) title = _state.Toast;
-
             List<string> lines = WrapBody(BubbleBody(), inner, 3);
             int titleH = LineHeight(_titleFont);
             int bodyH = lines.Count * LineHeight(_bodyFont);
@@ -293,13 +360,14 @@ namespace DshPet
 
         string BubbleBody()
         {
+            if (FocusHintVisible) return Localized("请从任务栏或托盘返回 DSH。", "Open DSH from the taskbar or system tray.");
             if (_state.AlertId.Length > 0) return _state.AlertText.Length > 0 ? _state.AlertText : _state.Line1;
             return _state.Line1;
         }
 
         string BubbleFooter()
         {
-            return _state.Line2;
+            return FocusHintVisible ? "" : _state.Line2;
         }
 
         int LineHeight(Font font)
@@ -428,7 +496,9 @@ namespace DshPet
             _compose = new Bitmap(width, height, PixelFormat.Format32bppArgb);
             _composeG = Graphics.FromImage(_compose);
             _composeG.SmoothingMode = SmoothingMode.AntiAlias;
-            _composeG.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            // 分层窗口是逐像素 alpha 合成的，ClearType 的次像素彩边会直接烙进透明位图（蓝/红描边），
+            // 必须用灰度抗锯齿，文字才在任意壁纸上干净
+            _composeG.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             _composeG.InterpolationMode = InterpolationMode.HighQualityBicubic;
             EnsureDib(width, height);
         }
@@ -473,7 +543,7 @@ namespace DshPet
                 int w = _compose.Width;
                 int h = _compose.Height;
                 _composeG.Clear(Color.Transparent);
-                DrawToolbar(_composeG);
+                DrawActions(_composeG);
                 DrawBubble(_composeG);
                 DrawPet(_composeG);
                 PushLayered();
@@ -490,64 +560,86 @@ namespace DshPet
 
         bool _composeInProgress;
 
-        void DrawToolbar(Graphics g)
+        /// <summary>
+        /// 动作条：宠物下方独立一行，**不画任何容器**——没有胶囊底、没有描边，
+        /// 所以宠物周围不会出现"最外面那个框"。平时整条不可见，悬停才淡入。
+        /// </summary>
+        void DrawActions(Graphics g)
         {
-            if (!HoverVisible) return;
-            Rectangle r = _toolbarRect;
-            int radius = r.Height / 2;
-            using (GraphicsPath path = Rounded(r, radius))
-            using (SolidBrush back = new SolidBrush(Color.FromArgb(246, 248, 253)))
-            using (Pen border = new Pen(Color.FromArgb(210, 214, 226)))
-            {
-                g.FillPath(back, path);
-                g.DrawPath(border, path);
-            }
-            DrawGlyphButton(g, _btnCompose, "✎", _hoverButton == 1);
-            DrawGlyphButton(g, _btnVoice, "🎤", _hoverButton == 2);
+            if (!HoverVisible || _actionsRect.IsEmpty) return;
+            DrawButtonPlate(g, _btnCompose, _hoverButton == 1);
+            DrawButtonPlate(g, _btnVoice, _hoverButton == 2);
+            Color ink1 = _hoverButton == 1 ? Color.FromArgb(28, 38, 68) : Color.FromArgb(58, 70, 104);
+            Color ink2 = _hoverButton == 2 ? Color.FromArgb(28, 38, 68) : Color.FromArgb(58, 70, 104);
+            DrawIconGlyph(g, _btnCompose, "\uE70F", ink1);
+            DrawIconGlyph(g, _btnVoice, "\uE720", ink2);
         }
 
-        void DrawGlyphButton(Graphics g, Rectangle r, string glyph, bool hot)
+        /// <summary>
+        /// 按钮底板：只是一枚很淡的圆形玻璃，不构成"外层框"。平时更淡，指针压上去才实一点。
+        /// </summary>
+        void DrawButtonPlate(Graphics g, Rectangle r, bool hot)
         {
-            if (hot)
+            int d = Math.Min(r.Width, r.Height) - S(2);
+            Rectangle circle = new Rectangle(r.X + (r.Width - d) / 2, r.Y + (r.Height - d) / 2, d, d);
+            using (GraphicsPath path = new GraphicsPath())
             {
-                using (GraphicsPath path = Rounded(r, S(7)))
-                using (SolidBrush brush = new SolidBrush(Color.FromArgb(226, 234, 252)))
+                path.AddEllipse(circle);
+                using (SolidBrush shadow = new SolidBrush(Color.FromArgb(hot ? 22 : 12, 24, 28, 44)))
                 {
-                    g.FillPath(brush, path);
+                    g.TranslateTransform(0f, S(1));
+                    g.FillPath(shadow, path);
+                    g.TranslateTransform(0f, -S(1));
+                }
+                using (SolidBrush plate = new SolidBrush(Color.FromArgb(hot ? 255 : 236, 255, 255, 255)))
+                {
+                    g.FillPath(plate, path);
                 }
             }
+        }
+
+        RectangleF IconBox(Rectangle r, int size)
+        {
+            float d = S(size);
+            return new RectangleF(r.X + (r.Width - d) / 2f, r.Y + (r.Height - d) / 2f, d, d);
+        }
+
+        /// <summary>
+        /// 图标字形：Segoe MDL2 Assets 是 Windows 自带的图标字体（✎ = E70F，麦克风 = E720），
+        /// 小尺寸下比自绘路径锐利，而且不会像 emoji 那样上色。
+        /// </summary>
+        void DrawIconGlyph(Graphics g, Rectangle r, string glyph, Color ink)
+        {
             StringFormat fmt = new StringFormat();
             fmt.Alignment = StringAlignment.Center;
             fmt.LineAlignment = StringAlignment.Center;
-            using (SolidBrush ink = new SolidBrush(Color.FromArgb(60, 74, 110)))
+            fmt.FormatFlags = StringFormatFlags.NoWrap;
+            using (SolidBrush brush = new SolidBrush(ink))
             {
-                g.DrawString(glyph, _glyphFont, ink, r, fmt);
+                g.DrawString(glyph, _iconFont, brush, r, fmt);
             }
             fmt.Dispose();
         }
 
         void DrawBubble(Graphics g)
         {
-            if (!BubbleVisible()) return;
-            int width = Math.Min(BubbleW, Math.Max(PetW, S(210)));
-            int height = MeasureBubble(width);
-            bool alert = _state.AlertId.Length > 0;
+            if (!BubbleVisible() || _bubbleRect.IsEmpty) return;
+            bool focusHint = FocusHintVisible;
+            bool alert = !focusHint && _state.AlertId.Length > 0;
             bool success = _state.IsSuccess;
-            Rectangle r = new Rectangle((_compose.Width - width) / 2, S(6) + (HoverVisible ? S(34) + S(6) : 0), width, height);
+            Rectangle r = _bubbleRect;
 
             Color bg = alert
-                ? (success ? Color.FromArgb(255, 250, 240) : Color.FromArgb(254, 244, 242))
-                : Color.FromArgb(252, 252, 254);
-            Color bd = alert
-                ? (success ? Color.FromArgb(224, 168, 78) : Color.FromArgb(226, 106, 92))
-                : Color.FromArgb(206, 210, 222);
+                ? (success ? Color.FromArgb(250, 251, 243, 226) : Color.FromArgb(250, 253, 236, 233))
+                : Color.FromArgb(244, 252, 252, 254);
 
+            // 外观：不要"框"。0.3 的三层圆角投影在浅色聊天区上就是一圈灰边，用户看到的就是它；
+            // 提醒态的 1px 彩色描边同样是一圈框。现在只留一层扁平填充，成功/失败靠填充色
+            // 和标题里的 ✔ / ✕ 区分，边缘不再有任何描边或投影。
             using (GraphicsPath path = Rounded(r, S(12)))
             using (SolidBrush back = new SolidBrush(bg))
-            using (Pen pen = new Pen(bd, 1f))
             {
                 g.FillPath(back, path);
-                g.DrawPath(pen, path);
             }
 
             int padX = S(12);
@@ -556,6 +648,7 @@ namespace DshPet
 
             string title = alert ? (success ? Localized("任务已经结束", "Task finished") : Localized("任务执行失败", "Task failed")) : _state.Title;
             if (!alert && _state.Toast.Length > 0) title = _state.Toast;
+            if (focusHint) title = Localized("未能切到 DSH", "Could not switch to DSH");
             if (title.Length == 0) title = Localized("智能伙伴", "Companion");
             if (alert) title = (success ? "✔ " : "✕ ") + title;
             title = ClipText(title, _titleFont, r.Width - padX * 2);
@@ -609,11 +702,8 @@ namespace DshPet
 
         void DrawPet(Graphics g)
         {
-            int petW = PetW;
-            int petH = PetH;
-            int x = (_compose.Width - petW) / 2;
-            int y = _compose.Height - S(6) - petH;
-            Rectangle dest = new Rectangle(x, y, petW, petH);
+            if (_petRect.IsEmpty) return;
+            Rectangle dest = _petRect;
 
             if (_sheet == null)
             {
@@ -811,6 +901,7 @@ namespace DshPet
         {
             int hash = 17;
             hash = hash * 31 + (BubbleVisible() ? 1 : 0);
+            hash = hash * 31 + (FocusHintVisible ? 1 : 0);
             hash = hash * 31 + (HoverVisible ? 1 : 0);
             hash = hash * 31 + PetW;
             hash = hash * 31 + PetH;
@@ -822,9 +913,40 @@ namespace DshPet
             return hash;
         }
 
+        void ReleaseStaleCapture()
+        {
+            if (_dragging || !IsHandleCreated) return;
+            if (Native.GetCapture() != Handle) return;
+            Native.ReleaseCapture();
+            Log.W("released stale capture");
+        }
+
+        void FinishPointerInteraction(bool buttonReleased)
+        {
+            if (!_dragging) return;
+            bool moved = _dragMoved;
+            _dragging = false;
+            _dragMoved = false;
+            if (Native.GetCapture() == Handle) Native.ReleaseCapture();
+
+            if (moved)
+            {
+                PinAnchorFromWindow();
+                Log.W("drag to " + Location.X + "," + Location.Y);
+                PostPos();
+            }
+            else if (buttonReleased)
+            {
+                OnPetClicked();
+            }
+            Relayout(false);
+        }
+
         void OnHoverTick()
         {
             if (_closing || !IsHandleCreated) return;
+            if (_dragging && !Native.IsPrimaryMouseButtonDown()) FinishPointerInteraction(false);
+            ReleaseStaleCapture();
             Point cursor = Cursor.Position;
             bool inside = Bounds.Contains(cursor);
             int button = 0;
@@ -862,9 +984,18 @@ namespace DshPet
         {
             if (m.Msg == Native.WM_NCHITTEST)
             {
+                // 菜单打开时宠物让出输入。写作窗打开时只有未被覆盖的操作按钮响应。
+                if (_menu != null && !_menu.IsDisposed && _menu.Visible)
+                {
+                    m.Result = (IntPtr)Native.HTTRANSPARENT;
+                    return;
+                }
                 Point screen = new Point((short)(m.LParam.ToInt32() & 0xFFFF), (short)((m.LParam.ToInt32() >> 16) & 0xFFFF));
                 Point local = PointToClient(screen);
-                m.Result = (IntPtr)(HitTest(local) ? Native.HTCLIENT : Native.HTTRANSPARENT);
+                bool acceptsClick = IsComposing
+                    ? !_composeWindow.Bounds.Contains(screen) && (_btnCompose.Contains(local) || _btnVoice.Contains(local))
+                    : HitTest(local);
+                m.Result = (IntPtr)(acceptsClick ? Native.HTCLIENT : Native.HTTRANSPARENT);
                 return;
             }
             if (m.Msg == Native.WM_MOUSEACTIVATE)
@@ -885,7 +1016,6 @@ namespace DshPet
                 _dragMoved = false;
                 _dragStartScreen = Cursor.Position;
                 _dragStartWindow = Location;
-                Native.SetCapture(Handle);
                 Log.W("mouse down at " + _dragStartScreen.X + "," + _dragStartScreen.Y);
                 return;
             }
@@ -896,39 +1026,41 @@ namespace DshPet
                     Point now = Cursor.Position;
                     int dx = now.X - _dragStartScreen.X;
                     int dy = now.Y - _dragStartScreen.Y;
-                    if (!_dragMoved && Math.Abs(dx) + Math.Abs(dy) > 4) _dragMoved = true;
+                    if (!_dragMoved && Math.Abs(dx) + Math.Abs(dy) > 4)
+                    {
+                        _dragMoved = true;
+                        // 只有真的拖动时才抢鼠标；单击不抢，避免偶发丢 up 后捕获悬挂
+                        Native.SetCapture(Handle);
+                    }
                     if (_dragMoved)
                     {
                         Location = ClampWindow(new Point(_dragStartWindow.X + dx, _dragStartWindow.Y + dy), Width, Height);
+                        // 残影：窗口先移动，分层表面还停在上一帧，下一次推送要等 80ms 的动画定时器，
+                        // 快速拖动时中间这些帧就是用户看到的拖尾。这里立刻补推一帧
+                        // （内容没变，PushLayered 只做一次全量 DIB 拷贝），并按 8ms 节流。
+                        long nowTick = Environment.TickCount;
+                        if (nowTick - _dragPushAt >= 8)
+                        {
+                            _dragPushAt = nowTick;
+                            PushLayered();
+                        }
                     }
                 }
                 return;
             }
             if (m.Msg == Native.WM_LBUTTONUP)
             {
-                if (_dragging)
-                {
-                    _dragging = false;
-                    Native.ReleaseCapture();
-                    if (_dragMoved)
-                    {
-                        PinAnchorFromWindow();
-                        Log.W("drag to " + Location.X + "," + Location.Y);
-                        PostPos();
-                    }
-                    else
-                    {
-                        OnPetClicked();
-                    }
-                    Relayout(false);
-                }
+                FinishPointerInteraction(true);
                 return;
             }
-            if (m.Msg == Native.WM_LBUTTONDBLCLK)
+            if (m.Msg == Native.WM_CAPTURECHANGED || m.Msg == Native.WM_CANCELMODE)
             {
-                FocusDsh("double-click");
+                FinishPointerInteraction(false);
+                base.WndProc(ref m);
                 return;
             }
+            // 双击的第一次松手已按单击处理。
+            if (m.Msg == Native.WM_LBUTTONDBLCLK) return;
             if (m.Msg == Native.WM_RBUTTONUP)
             {
                 ShowMenu();
@@ -936,7 +1068,8 @@ namespace DshPet
             }
             if (m.Msg == Native.WM_DPICHANGED)
             {
-                RecomputeDpi();
+                int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+                if (dpi > 0) _dpi = dpi / 96f;
                 Relayout(true);
                 return;
             }
@@ -954,23 +1087,10 @@ namespace DshPet
             return new Point((short)(value & 0xFFFF), (short)((value >> 16) & 0xFFFF));
         }
 
-        void RecomputeDpi()
-        {
-            try
-            {
-                using (Graphics g = CreateGraphics())
-                {
-                    _dpi = Math.Max(1f, g.DpiX / 96f);
-                }
-            }
-            catch { }
-        }
-
         void PinAnchorFromWindow()
         {
             _anchorX = Location.X + Width / 2;
             _anchorY = Location.Y + Height - S(6);
-            _anchorFromServer = false;
         }
 
         void OnPetClicked()
@@ -984,18 +1104,14 @@ namespace DshPet
 
         void ShowMenu()
         {
-            if (_menu != null && !_menu.IsDisposed)
-            {
-                _menu.Close();
-                _menu = null;
-            }
+            CloseMenu();
+            FinishPointerInteraction(false);
+            ReleaseStaleCapture();
             List<OverlayMenu.Entry> entries = BuildMenuEntries();
-            _menu = new OverlayMenu(entries, OnMenuPick);
-            Rectangle working = Screen.FromControl(this).WorkingArea;
-            Point origin = new Point(Location.X + Width - _menu.Width, Location.Y + Height - S(6) - _menu.Height);
-            if (origin.X < working.Left + 4) origin.X = working.Left + 4;
-            if (origin.Y < working.Top + 4) origin.Y = working.Top + 4;
-            if (origin.Y + _menu.Height > working.Bottom - 4) origin.Y = working.Bottom - 4 - _menu.Height;
+            _menu = new OverlayMenu(entries, OnMenuPick, _dpi);
+            Rectangle working = Screen.FromRectangle(RectangleToScreen(_petRect)).WorkingArea;
+            Point origin = new Point(Math.Max(working.Left, Right - _menu.PanelWidth),
+                Math.Max(working.Top, Bottom - S(6) - _menu.PanelHeight));
             _menu.ShowAt(origin);
         }
 
@@ -1038,6 +1154,7 @@ namespace DshPet
             list.Add(size);
 
             list.Add(OverlayMenu.Entry.Check("sound", Localized("结束提示音", "Finish sound"), _state.Sound, true));
+            list.Add(OverlayMenu.Entry.Item("copy", Localized("复制最近一条", "Copy latest line"), (_state.Line1 ?? "").Length > 0));
             list.Add(OverlayMenu.Entry.Separator());
 
             OverlayMenu.Entry rehearse = OverlayMenu.Entry.Submenu("test", Localized("测试提醒", "Rehearse alert"));
@@ -1053,7 +1170,13 @@ namespace DshPet
         {
             try
             {
-                if (id == "open") FocusDsh("menu");
+                if (id == "open")
+                {
+                    // 先把自己的菜单关掉再激活：菜单窗口此刻占着前台，直接抢会一直被拒。
+                    CloseMenu();
+                    BeginInvoke(new Action(delegate { FocusDsh("menu"); }));
+                }
+                else if (id == "copy") CopyLastLine();
                 else if (id == "quit") Close();
                 else if (id == "install") InstallPet();
                 else if (id == "opendir") OpenPetsFolder();
@@ -1067,6 +1190,36 @@ namespace DshPet
             catch (Exception error)
             {
                 Log.W("menu action failed: " + error.Message);
+            }
+        }
+
+        void CloseMenu()
+        {
+            if (_menu != null && !_menu.IsDisposed)
+            {
+                _menu.Close();
+                _menu = null;
+            }
+        }
+
+        /// <summary>把当前气泡正文放进剪贴板：分层窗口里的文字选不中，这是唯一的复制口子。</summary>
+        void CopyLastLine()
+        {
+            try
+            {
+                string text = _state.Line1 ?? "";
+                if (text.Length == 0) text = _state.Title ?? "";
+                if (text.Length == 0)
+                {
+                    Log.W("copy skipped: nothing to copy");
+                    return;
+                }
+                Clipboard.SetText(text);
+                Log.W("copied bubble text " + text.Length + " chars");
+            }
+            catch (Exception error)
+            {
+                Log.W("copy failed: " + error.Message);
             }
         }
 
@@ -1116,56 +1269,129 @@ namespace DshPet
 
         void OpenCompose(bool voice)
         {
-            if (_composeWindow != null && !_composeWindow.IsDisposed && _composeWindow.Visible)
+            ReleaseStaleCapture();
+            if (IsComposing)
             {
                 _composeWindow.Activate();
+                if (voice) _composeWindow.StartVoice();
                 return;
             }
-            _composeVoice = voice;
-            _composeWindow = new ComposeWindow(new Rectangle(0, 0, S(330), S(120)), Localized, SubmitText, voice);
-            Rectangle working = Screen.FromControl(this).WorkingArea;
-            int w = _composeWindow.Width;
-            int h = _composeWindow.Height;
-            int x = Location.X + Width / 2 - w / 2;
-            int y = Location.Y - h - S(8);
-            if (y < working.Top + 4) y = Location.Y + Height - S(6) - PetH - h - S(8);
-            if (x < working.Left + 4) x = working.Left + 4;
-            if (x + w > working.Right - 4) x = working.Right - 4 - w;
-            if (y < working.Top + 4) y = working.Top + 4;
-            _composeWindow.Location = new Point(x, y);
-            _composeWindow.FormClosed += delegate
+
+            ComposeWindow window = new ComposeWindow(
+                new Rectangle(0, 0, S(350), S(224)),
+                Localized, LoadComposeTargets, SubmitText, voice);
+            _composeWindow = window;
+            window.SizeChanged += delegate { PlaceCompose(window); };
+            window.FormClosed += delegate
             {
+                if (_composeWindow != window) return;
                 _composeWindow = null;
-                Relayout(false);
+                if (!_closing) Relayout(false);
             };
-            _composeWindow.Show();
+            PlaceCompose(window);
+            window.Show(this);
             Relayout(false);
+            PlaceCompose(window);
         }
 
-        void SubmitText(string text)
+        void PlaceCompose(ComposeWindow window)
         {
-            string content = (text ?? "").Trim();
-            if (content.Length == 0) return;
-            try
+            if (window.IsDisposed) return;
+            Rectangle pet = _petRect;
+            pet.Offset(Location);
+            Rectangle area = Screen.FromRectangle(pet).WorkingArea;
+            int gap = S(8);
+            int above = Math.Min(pet.Top, Top) - window.Height - gap;
+            int below = Math.Max(pet.Bottom, Bottom) + gap;
+            int x = pet.Left + (pet.Width - window.Width) / 2;
+            int y = above >= area.Top ? above : below;
+            if (y + window.Height > area.Bottom)
             {
-                Dictionary<string, string> form = new Dictionary<string, string>();
-                form["text"] = content;
-                string result = Http.PostForm(_opts.Host + _opts.Prefix + "/say", _opts.Token, form, 20000);
-                Log.W("say result: " + result.Replace("\n", " "));
-                if (result.StartsWith("失败") || result.StartsWith("error") || result.IndexOf("\"ok\":false") >= 0)
-                {
-                    if (_composeWindow != null) _composeWindow.ShowError(result);
-                }
-                else if (_composeWindow != null)
-                {
-                    _composeWindow.Close();
-                }
+                int right = pet.Right + gap;
+                int left = pet.Left - gap - window.Width;
+                if (right + window.Width <= area.Right) x = right;
+                else if (left >= area.Left) x = left;
+                y = pet.Top - (window.Height - pet.Height) / 2;
             }
-            catch (Exception error)
+
+            x = Math.Max(area.Left, Math.Min(x, area.Right - window.Width));
+            y = Math.Max(area.Top, Math.Min(y, area.Bottom - window.Height));
+            window.Location = new Point(x, y);
+        }
+
+        static Dictionary<string, string> DecodeComposeResponse(string response)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (string line in response.Split('\n'))
             {
-                Log.W("say failed: " + error.Message);
-                if (_composeWindow != null) _composeWindow.ShowError(Localized("发送失败：", "Send failed: ") + error.Message);
+                int equals = line.IndexOf('=');
+                if (equals <= 0) continue;
+                fields[line.Substring(0, equals)] = Uri.UnescapeDataString(line.Substring(equals + 1).TrimEnd('\r'));
             }
+            return fields;
+        }
+
+        Task<ComposeTarget[]> LoadComposeTargets()
+        {
+            return Task.Run(delegate
+            {
+                string response = Http.Get(_opts.Host + _opts.Prefix + "/compose-targets", _opts.Token, 8000);
+                Dictionary<string, string> fields = DecodeComposeResponse(response);
+                List<ComposeTarget> targets = new List<ComposeTarget>();
+                string preferred;
+                fields.TryGetValue("preferredId", out preferred);
+                for (int index = 0; ; index++)
+                {
+                    string prefix = "target." + index + ".";
+                    string id;
+                    if (!fields.TryGetValue(prefix + "id", out id)) break;
+                    string title;
+                    fields.TryGetValue(prefix + "title", out title);
+                    targets.Add(new ComposeTarget(id, title, id == preferred));
+                }
+                return targets.ToArray();
+            });
+        }
+
+        Task<ComposeSubmitResult> SubmitText(string targetId, string text, string requestId)
+        {
+            string unknown = Localized(
+                "发送结果待确认。可用同一草稿重试，或去 DSH 检查。",
+                "Delivery is unconfirmed. Retry the same draft or check DSH.");
+            string unavailable = Localized("连接不上 DSH，草稿已保留。", "Can't connect to DSH. Your draft is still here.");
+            return Task.Run(delegate
+            {
+                try
+                {
+                    Dictionary<string, string> form = new Dictionary<string, string>
+                    {
+                        { "targetId", targetId },
+                        { "text", text },
+                        { "requestId", requestId }
+                    };
+                    string response = Http.PostForm(_opts.Host + _opts.Prefix + "/say", _opts.Token, form, 20000);
+                    Dictionary<string, string> fields = DecodeComposeResponse(response);
+                    string status, message;
+                    fields.TryGetValue("status", out status);
+                    fields.TryGetValue("message", out message);
+                    if (status == "sent") return new ComposeSubmitResult(true, message);
+                    if (status == "failed") return new ComposeSubmitResult(false, message ?? unavailable);
+                    return new ComposeSubmitResult(false, message ?? unknown, true);
+                }
+                catch (WebException error)
+                {
+                    HttpWebResponse response = error.Response as HttpWebResponse;
+                    if (response != null)
+                    {
+                        HttpStatusCode code = response.StatusCode;
+                        response.Dispose();
+                        if ((int)code >= 400 && (int)code < 500) return new ComposeSubmitResult(false, unavailable);
+                    }
+                    if (error.Status == WebExceptionStatus.ConnectFailure)
+                        return new ComposeSubmitResult(false, unavailable);
+                    return new ComposeSubmitResult(false, unknown, true);
+                }
+            });
         }
 
         // ================= 与宿主通信 =================
@@ -1176,6 +1402,8 @@ namespace DshPet
             form["pos"] = "1";
             form["posx"] = _anchorX.ToString();
             form["posy"] = _anchorY.ToString();
+            _serverPosX = _anchorX;
+            _serverPosY = _anchorY;
             Post("/config", form);
         }
 
@@ -1236,6 +1464,44 @@ namespace DshPet
                     Log.W("post ready failed: " + error.Message);
                 }
             });
+        }
+
+        /// <summary>浮层 UI 看门狗，记录消息处理停顿和恢复时间。</summary>
+        void StartStallWatchdog()
+        {
+            Thread watchdog = new Thread(delegate()
+            {
+                while (!_closing)
+                {
+                    Thread.Sleep(2000);
+                    if (_closing || !IsHandleCreated) continue;
+                    Stopwatch probe = Stopwatch.StartNew();
+                    int responded = 0;
+                    try
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            Interlocked.Exchange(ref responded, 1);
+                            if (probe.ElapsedMilliseconds >= 1500) Log.W("ui resumed after " + probe.ElapsedMilliseconds + "ms");
+                        }));
+                    }
+                    catch (InvalidOperationException) { continue; }
+
+                    bool reported = false;
+                    while (!_closing && Interlocked.CompareExchange(ref responded, 0, 0) == 0)
+                    {
+                        if (!reported && probe.ElapsedMilliseconds >= 1500)
+                        {
+                            Log.W("ui stall: overlay window messages pending");
+                            reported = true;
+                        }
+                        Thread.Sleep(250);
+                    }
+                }
+            });
+            watchdog.IsBackground = true;
+            watchdog.Name = "dsh-pet-stall";
+            watchdog.Start();
         }
 
         void StartPolling()
@@ -1324,11 +1590,17 @@ namespace DshPet
             bool first = !_connectedOnce;
             _connectedOnce = true;
             if (state.DshPid > 0) _dshPid = state.DshPid;
-            if (state.PosX != int.MinValue && !_anchorFromServer)
+            if (state.PosX != int.MinValue && (state.PosX != _serverPosX || state.PosY != _serverPosY))
             {
-                _anchorX = state.PosX;
-                _anchorY = state.PosY;
-                _anchorFromServer = true;
+                _serverPosX = state.PosX;
+                _serverPosY = state.PosY;
+                // 拖动过程中别抢方向盘；松手后的回写会带着同一个值回来，不会互相打架
+                if (!_dragging)
+                {
+                    _anchorX = state.PosX;
+                    _anchorY = state.PosY;
+                    Relayout(true);
+                }
             }
 
             // 内容指纹不能带上每秒都在变的耗时，否则气泡永远不会自动收起
@@ -1404,38 +1676,59 @@ namespace DshPet
 
         void FocusDsh(string reason)
         {
+            int now = Environment.TickCount;
+            if (_focusPending || (_focusRequested && unchecked((uint)(now - _lastFocusAt)) < 500)) return;
+            _focusRequested = true;
+            _lastFocusAt = now;
             int pid = _dshPid > 0 ? _dshPid : _state.DshPid;
-            if (pid > 0)
+            if (pid <= 0)
             {
-                IntPtr hwnd = Native.FindMainWindow(pid);
-                if (hwnd != IntPtr.Zero)
-                {
-                    if (Native.RevealAndFocus(hwnd))
-                    {
-                        Log.W("focused DSH window (" + reason + ") hwnd=" + hwnd.ToInt64());
-                        return;
-                    }
-                    Log.W("focus refused (" + reason + "), falling back to relaunch");
-                }
-                else
-                {
-                    Log.W("no window for pid " + pid + " (" + reason + "), falling back to relaunch");
-                }
+                Log.W("cannot open DSH (" + reason + "): no pid yet");
+                ShowFocusHint();
+                return;
             }
-            if (_dshExe.Length > 0 && File.Exists(_dshExe))
+
+            _focusPending = true;
+            Log.W("focus requested (" + reason + ") pid=" + pid);
+            ThreadPool.QueueUserWorkItem(delegate
             {
+                Stopwatch elapsed = Stopwatch.StartNew();
+                bool activated = false;
                 try
                 {
-                    Process.Start(_dshExe);
-                    Log.W("relaunched DSH exe (" + reason + ") " + _dshExe);
-                    return;
+                    IntPtr hwnd = Native.FindMainWindow(pid);
+                    string result = "DSH window unavailable";
+                    if (hwnd != IntPtr.Zero) activated = Native.RequestDshOpen(hwnd, pid, out result);
+                    Log.W("focus result (" + reason + "): " + result + ", hwnd=" + hwnd.ToInt64()
+                        + ", elapsed=" + elapsed.ElapsedMilliseconds + "ms");
                 }
                 catch (Exception error)
                 {
-                    Log.W("relaunch failed: " + error.Message);
+                    Log.W("focus failed (" + reason + "): " + error.Message);
                 }
-            }
-            Log.W("cannot open DSH (" + reason + "): pid=" + pid + " exe=" + _dshExe);
+
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        _focusPending = false;
+                        if (_closing) return;
+                        if (!activated) ShowFocusHint();
+                        else if (FocusHintVisible)
+                        {
+                            _focusHintUntil = DateTime.MinValue;
+                            Relayout(false);
+                        }
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            });
+        }
+
+        void ShowFocusHint()
+        {
+            _focusHintUntil = DateTime.UtcNow.AddSeconds(4);
+            Relayout(false);
         }
     }
 }
