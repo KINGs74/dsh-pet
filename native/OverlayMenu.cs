@@ -9,7 +9,6 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Windows.Forms;
-using Microsoft.Win32;
 
 namespace DshPet
 {
@@ -61,15 +60,15 @@ namespace DshPet
         }
 
         const int OuterMargin = 6;
-        const int PanelPadY = 7;
-        const int ItemHeight = 30;
+        const int PanelPadY = 6;
+        const int ItemHeight = 29;
         const int SeparatorHeight = 9;
         const int PadLeft = 12;
         const int CheckWidth = 20;
         const int ArrowWidth = 16;
         const int PadRight = 10;
         const int MinWidth = 156;
-        const int ColumnGap = 4;
+        const int ColumnGap = 6;
 
         readonly List<Entry> _entries;
         readonly Action<string> _onPick;
@@ -101,15 +100,8 @@ namespace DshPet
         Rectangle[] _mainRects = new Rectangle[0];
         Rectangle[] _subRects = new Rectangle[0];
 
-        Color _panel;
-        Color _text;
-        Color _dim;
-        Color _hoverBg;
-        Color _sep;
-        Color _accent;
-
-        Font _font;
-        Font _boldFont;
+        OverlayPalette _palette = OverlayPalette.Current();
+        readonly Font _font;
 
         public OverlayMenu(List<Entry> entries, Action<string> onPick, float dpi)
         {
@@ -126,27 +118,7 @@ namespace DshPet
             BackColor = Color.Black;
 
             _dpi = dpi > 0 ? dpi : 1f;
-            _font = new Font("Microsoft YaHei UI", 12f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel);
-            _boldFont = new Font("Microsoft YaHei UI", 12f * _dpi, FontStyle.Bold, GraphicsUnit.Pixel);
-
-            if (IsDarkTheme())
-            {
-                _panel = Color.FromArgb(250, 28, 30, 36);
-                _text = Color.FromArgb(255, 232, 235, 243);
-                _dim = Color.FromArgb(255, 132, 137, 150);
-                _hoverBg = Color.FromArgb(255, 46, 52, 64);
-                _sep = Color.FromArgb(255, 52, 56, 66);
-                _accent = Color.FromArgb(255, 122, 162, 255);
-            }
-            else
-            {
-                _panel = Color.FromArgb(251, 252, 252, 255);
-                _text = Color.FromArgb(255, 32, 36, 48);
-                _dim = Color.FromArgb(255, 130, 136, 150);
-                _hoverBg = Color.FromArgb(255, 232, 239, 252);
-                _sep = Color.FromArgb(255, 230, 233, 242);
-                _accent = Color.FromArgb(255, 43, 108, 246);
-            }
+            _font = new Font("Microsoft YaHei UI", 12.5f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel);
 
             _deactivateTimer.Interval = 140;
             _deactivateTimer.Tick += delegate
@@ -208,21 +180,6 @@ namespace DshPet
             OnMouseMove(new MouseEventArgs(MouseButtons.None, 0, client.X, client.Y, 0));
         }
 
-        static bool IsDarkTheme()
-        {
-            try
-            {
-                object value = Registry.GetValue(
-                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                    "AppsUseLightTheme", 1);
-                if (value is int) return (int)value == 0;
-            }
-            catch
-            {
-            }
-            return false;
-        }
-
         int S(int value)
         {
             return (int)Math.Round(value * _dpi);
@@ -262,12 +219,12 @@ namespace DshPet
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
             using (StringFormat fmt = StringFormat.GenericTypographic)
             {
-                g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
                 for (int i = 0; i < _entries.Count; i++)
                 {
                     Entry e = _entries[i];
                     if (e.IsSeparator) continue;
-                    SizeF size = g.MeasureString(e.Text, e.IsSubmenu ? _boldFont : _font, 4096, fmt);
+                    SizeF size = g.MeasureString(e.Text, _font, 4096, fmt);
                     int need = (int)Math.Ceiling(size.Width) + S(PadLeft + CheckWidth + PadRight + ArrowWidth);
                     if (need > mainW) mainW = need;
                 }
@@ -280,7 +237,7 @@ namespace DshPet
                 using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
                 using (StringFormat fmt = StringFormat.GenericTypographic)
                 {
-                    g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+                    g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
                     for (int i = 0; i < sub.Count; i++)
                     {
                         Entry e = sub[i];
@@ -350,7 +307,7 @@ namespace DshPet
                 {
                     Entry e = sub[i];
                     int h = e.IsSeparator ? S(SeparatorHeight) : S(ItemHeight);
-                    _subRects[i] = new Rectangle(_subLeft, sy, subW, h);
+                    _subRects[i] = new Rectangle(_subLeft + S(PadLeft) / 2, sy, subW - S(PadLeft), h);
                     sy += h;
                 }
                 int minX = Math.Min(0, _subLeft);
@@ -367,10 +324,10 @@ namespace DshPet
             }
 
             int margin = S(OuterMargin);
-            Size = new Size(_panelW + margin * 2, _panelH + margin * 2);
-            if (_surface.Width != Width || _surface.Height != Height) _surface.Resize(Width, Height);
-            PlaceWindow();
-            Render();
+            int width = _panelW + margin * 2;
+            int heightPx = _panelH + margin * 2;
+            _surface.Resize(width, heightPx);
+            RenderAt(MenuLocation(width, heightPx));
         }
 
         Rectangle WorkArea()
@@ -382,19 +339,19 @@ namespace DshPet
         }
 
         // 主列位置是锚点：窗口尺寸（含翻到左边的子菜单）变化时，主列不能跟着动
-        void PlaceWindow()
+        Point MenuLocation(int width, int height)
         {
-            if (_panelScreenX == int.MinValue) return;
+            if (_panelScreenX == int.MinValue) return Location;
             int margin = S(OuterMargin);
             Rectangle wa = WorkArea();
             // 主列画在 margin + _contentShift 处，窗口左边界要反向抵消，否则主列会被推两次
             int x = _panelScreenX - margin - _contentShift;
             int y = _panelScreenY - margin;
-            if (x + Width > wa.Right) x = wa.Right - Width;
+            if (x + width > wa.Right) x = wa.Right - width;
             if (x < wa.Left) x = wa.Left;
-            if (y + Height > wa.Bottom) y = wa.Bottom - Height;
+            if (y + height > wa.Bottom) y = wa.Bottom - height;
             if (y < wa.Top) y = wa.Top;
-            Location = new Point(x, y);
+            return new Point(x, y);
         }
 
         public void ShowAt(Point panelOrigin)
@@ -417,7 +374,7 @@ namespace DshPet
             Show();
             Activate();
             _previousMouseButtons = Native.PressedMouseButtons();
-            _surface.Push(this);
+            Present(Location);
             if (_hoverTimer != null) _hoverTimer.Start();
         }
 
@@ -426,128 +383,110 @@ namespace DshPet
 
         void Render()
         {
+            RenderAt(Location);
+        }
+
+        void RenderAt(Point destination)
+        {
             Graphics g = _surface.Graphics;
             if (g == null) return;
             g.Clear(Color.Transparent);
-            int margin = S(OuterMargin);
-            Rectangle panel = new Rectangle(margin + _contentShift, margin, _mainW, _mainH);
-
-            // 外观：不要"框"。原来的三层投影 + 1px 描边在浅色背景上就是一圈灰框，
-            // 现在只留一层扁平填充，靠填充色本身与背景区分。
-            using (GraphicsPath path = RoundRect(panel, S(10)))
-            using (SolidBrush brush = new SolidBrush(_panel))
-            {
-                g.FillPath(brush, path);
-            }
-
+            PaintPanel(g, Offset(new Rectangle(0, 0, _mainW, _mainH)));
             for (int i = 0; i < _entries.Count; i++)
             {
-                DrawMainItem(g, i);
+                bool open = _openSub == i;
+                DrawRow(g, _entries[i], Offset(_mainRects[i]), _hoverMain == i || open, true, open && _subLeft < 0);
             }
 
             List<Entry> sub = SubEntries();
             if (sub != null)
             {
-                Rectangle subRect = new Rectangle(margin + _contentShift + _subLeft, margin + _subTop, _subW, _subH);
-                using (GraphicsPath path = RoundRect(subRect, S(10)))
-                using (SolidBrush brush = new SolidBrush(_panel))
-                {
-                    g.FillPath(brush, path);
-                }
+                PaintPanel(g, Offset(new Rectangle(_subLeft, _subTop, _subW, _subH)));
                 for (int i = 0; i < sub.Count; i++)
-                {
-                    DrawSubItem(g, i);
-                }
+                    DrawRow(g, sub[i], Offset(_subRects[i]), _hoverSub == i, false, false);
             }
-
-            _surface.Push(this);
+            Present(destination);
         }
 
-        void DrawMainItem(Graphics g, int index)
+        void Present(Point destination)
         {
-            Entry e = _entries[index];
-            Rectangle rect = Offset(_mainRects[index]);
-            if (e.IsSeparator)
-            {
-                using (Pen pen = new Pen(_sep, 1f))
-                {
-                    g.DrawLine(pen, rect.Left + S(10), rect.Top + rect.Height / 2, rect.Right - S(6), rect.Top + rect.Height / 2);
-                }
-                return;
-            }
-            if (index == _hoverMain) FillHover(g, rect);
-            DrawRow(g, e, rect, index == _hoverMain, true);
+            if (_surface.Push(this, destination)) UpdateBounds();
         }
 
-        void DrawSubItem(Graphics g, int index)
+        void PaintPanel(Graphics g, Rectangle rect)
         {
-            List<Entry> sub = SubEntries();
-            if (sub == null || index >= sub.Count) return;
-            Entry e = sub[index];
-            Rectangle rect = Offset(_subRects[index]);
-            if (e.IsSeparator)
-            {
-                using (Pen pen = new Pen(_sep, 1f))
-                {
-                    g.DrawLine(pen, rect.Left + S(10), rect.Top + rect.Height / 2, rect.Right - S(6), rect.Top + rect.Height / 2);
-                }
-                return;
-            }
-            if (index == _hoverSub) FillHover(g, rect);
-            DrawRow(g, e, rect, index == _hoverSub, false);
+            using (GraphicsPath shape = RoundRect(rect, S(13)))
+            using (SolidBrush brush = new SolidBrush(_palette.Surface))
+                g.FillPath(brush, shape);
         }
 
         Rectangle Offset(Rectangle rect)
         {
             int margin = S(OuterMargin);
-            return new Rectangle(rect.X + margin + _contentShift, rect.Y + margin, rect.Width, rect.Height);
+            rect.Offset(margin + _contentShift, margin);
+            return rect;
         }
 
-        void FillHover(Graphics g, Rectangle rect)
+        void DrawRow(Graphics g, Entry entry, Rectangle bounds, bool hovered, bool hasArrowSpace, bool pointsLeft)
         {
-            Rectangle r = new Rectangle(rect.X + S(4), rect.Y + S(1), rect.Width - S(8) - S(PadLeft), rect.Height - S(2));
-            using (GraphicsPath path = RoundRect(r, S(7)))
-            using (SolidBrush brush = new SolidBrush(_hoverBg))
+            float midY = bounds.Top + bounds.Height / 2f;
+            if (entry.IsSeparator)
             {
-                g.FillPath(brush, path);
+                using (Pen line = new Pen(_palette.Line, Math.Max(1, S(1))))
+                    g.DrawLine(line, bounds.Left + S(6), midY, bounds.Right - S(6), midY);
+                return;
+            }
+
+            bool highlighted = hovered && entry.Enabled;
+            if (highlighted)
+            {
+                Rectangle highlight = Rectangle.Inflate(bounds, 0, -S(1));
+                using (GraphicsPath shape = RoundRect(highlight, S(8)))
+                using (SolidBrush brush = new SolidBrush(_palette.Hover))
+                    g.FillPath(brush, shape);
+            }
+
+            Color text = !entry.Enabled ? _palette.Muted : entry.Id == "quit" ? _palette.Failure : _palette.Text;
+            int textLeft = bounds.Left + S(CheckWidth + 4);
+            int textWidth = Math.Max(1, bounds.Right - textLeft - S(hasArrowSpace ? ArrowWidth : 6));
+            Rectangle textBox = new Rectangle(textLeft, bounds.Top, textWidth, bounds.Height);
+            using (StringFormat format = new StringFormat())
+            using (SolidBrush brush = new SolidBrush(text))
+            {
+                format.LineAlignment = StringAlignment.Center;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+                format.Trimming = StringTrimming.EllipsisCharacter;
+                g.DrawString(entry.Text, _font, brush, textBox, format);
+            }
+
+            if (entry.Checked)
+            {
+                float x = bounds.Left + S(11);
+                using (Pen stroke = SymbolPen(entry.Enabled ? _palette.Accent : _palette.Muted))
+                    g.DrawLines(stroke, new PointF[] {
+                        new PointF(x - S(4), midY), new PointF(x - S(1), midY + S(3)), new PointF(x + S(5), midY - S(4))
+                    });
+            }
+
+            if (hasArrowSpace && entry.IsSubmenu)
+            {
+                float x = bounds.Right - S(9);
+                int direction = pointsLeft ? -1 : 1;
+                using (Pen stroke = SymbolPen(highlighted ? _palette.Accent : _palette.Muted))
+                    g.DrawLines(stroke, new PointF[] {
+                        new PointF(x - direction * S(2), midY - S(4)), new PointF(x + direction * S(2), midY),
+                        new PointF(x - direction * S(2), midY + S(4))
+                    });
             }
         }
 
-        void DrawRow(Graphics g, Entry e, Rectangle rect, bool hovered, bool hasArrow)
+        Pen SymbolPen(Color color)
         {
-            Color color = e.Enabled ? _text : _dim;
-            int textLeft = rect.X + S(PadLeft) / 2 + S(CheckWidth);
-
-            if (e.Checked)
-            {
-                using (Font glyph = new Font("Segoe UI Symbol", 12f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (SolidBrush brush = new SolidBrush(e.Enabled ? _accent : _dim))
-                {
-                    g.DrawString("✓", glyph, brush, rect.X + S(6), rect.Y + (rect.Height - S(18)) / 2f);
-                }
-            }
-
-            StringFormat fmt = StringFormat.GenericTypographic;
-            fmt.LineAlignment = StringAlignment.Center;
-            fmt.FormatFlags |= StringFormatFlags.NoWrap;
-            // 宽度必须用右边界推算；textLeft 是绝对坐标，用 rect.Width 相减在子菜单翻到左侧时会变负数，文字整段消失
-            int textWidth = rect.Right - textLeft - (hasArrow ? S(ArrowWidth) : S(6));
-            if (textWidth < S(24)) textWidth = S(24);
-            Rectangle textRect = new Rectangle(textLeft, rect.Y, textWidth, rect.Height);
-            using (SolidBrush brush = new SolidBrush(color))
-            {
-                g.DrawString(e.Text, e.IsSubmenu ? _boldFont : _font, brush, textRect, fmt);
-            }
-            fmt.Dispose();
-
-            if (hasArrow && e.IsSubmenu)
-            {
-                using (Font glyph = new Font("Segoe UI Symbol", (32f / 3f) * _dpi, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (SolidBrush brush = new SolidBrush(hovered ? _accent : _dim))
-                {
-                    g.DrawString("▶", glyph, brush, rect.Right - S(ArrowWidth), rect.Y + (rect.Height - S(16)) / 2f);
-                }
-            }
+            Pen stroke = new Pen(color, Math.Max(1f, 1.5f * _dpi));
+            stroke.StartCap = LineCap.Round;
+            stroke.EndCap = LineCap.Round;
+            stroke.LineJoin = LineJoin.Round;
+            return stroke;
         }
 
         static GraphicsPath RoundRect(Rectangle rect, int radius)
@@ -586,6 +525,15 @@ namespace DshPet
 
         protected override void WndProc(ref Message m)
         {
+            if (OverlayPalette.IsThemeMessage(m.Msg))
+            {
+                OverlayPalette palette = OverlayPalette.Current();
+                if (_palette != palette)
+                {
+                    _palette = palette;
+                    if (Visible) Render();
+                }
+            }
             if (m.Msg == Native.WM_NCHITTEST)
             {
                 int coordinates = unchecked((int)m.LParam.ToInt64());
@@ -860,7 +808,6 @@ namespace DshPet
             }
             _surface.Dispose();
             _font.Dispose();
-            _boldFont.Dispose();
             base.OnFormClosed(e);
         }
     }

@@ -129,3 +129,18 @@ test('回滚之后立刻把文件修好，不必等到下一次写入', async ()
   const bak = JSON.parse(await readFile(`${file}.bak`, 'utf8'));
   assert.equal(bak.pet, 'boba');
 });
+
+test('显示状态默认打开，隐藏后可持久化并恢复', async () => {
+  const folder = await mkdtemp(join(tmpdir(), 'dsh-pet-visibility-'));
+  try {
+    const store = new ConfigStore(folder);
+    assert.equal((await store.load()).visible, true);
+    await store.patch({ visible: false });
+    const reopened = new ConfigStore(folder);
+    assert.equal((await reopened.load()).visible, false);
+    await reopened.patch({ visible: true });
+    assert.equal((await new ConfigStore(folder).load()).visible, true);
+  } finally {
+    await (await import('node:fs/promises')).rm(folder, { recursive: true, force: true });
+  }
+});

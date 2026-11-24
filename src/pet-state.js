@@ -122,6 +122,7 @@ export class PetModel {
     // 演练文案只挂在提醒上，绝不写进 lastText —— 否则演练完气泡会一直停在"退出码 1"上
     this.rehearsal = '';
     this.alert = null;
+    this.notice = null;
     this.ackedId = '';
     this.turnStartedAt = 0;
     this.endedAt = 0;
@@ -221,8 +222,8 @@ export class PetModel {
       }
       case 'user/message': {
         entry.turn = Number(e.turn ?? entry.turn ?? 0) || entry.turn;
-        const text = excerpt(textOfMessage(e.message ?? e.userMessage), 200);
-        if (text) this.lastUser = text;
+        const text = excerpt(textOfMessage(e.message ?? e.userMessage ?? e), 200);
+        if (isActive && text) this.lastUser = text;
         if (isActive) {
           this.status = PetStatus.running;
           this.turnStartedAt = this.now();
@@ -235,13 +236,14 @@ export class PetModel {
       case 'assistant/message': {
         const streaming = e.stream === true;
         const text = excerpt(textOfMessage(e.message), 200);
-        if (text && !streaming) this.lastText = text;
+        if (isActive && text && !streaming) this.lastText = text;
         if (isActive && !streaming) this.status = PetStatus.running;
         break;
       }
       case 'turn/end': {
         const kind = reasonKind(e.reason);
-        if (isActive) {
+        if (isActive && entry.isRoot) {
+          entry.turn = Number(e.turn ?? entry.turn) || entry.turn;
           this.endedAt = this.now();
           const success = kind === 'completed';
           this.status = success ? PetStatus.done : PetStatus.failed;
@@ -255,6 +257,7 @@ export class PetModel {
             kind,
             text: '',
           };
+          this.rememberNotice();
           this.updatedAt = this.endedAt;
         }
         break;
@@ -347,7 +350,20 @@ export class PetModel {
         : `${label}：第 42 步 执行 ops_bash 时退出码 1（演练）`;
     }
     this.alert = { id: `preview:${at}`, kind, text: '' };
+    this.rememberNotice();
     this.updatedAt = at;
+  }
+
+  rememberNotice() {
+    if (this.notice?.id === this.alert.id) return;
+    const { title, line1 } = this.snapshot();
+    const heading = this.alertTitle;
+    this.notice = {
+      id: this.alert.id,
+      kind: this.alert.kind,
+      title: heading,
+      body: [title, line1 === heading ? '' : line1].filter(Boolean).join(' · '),
+    };
   }
 
   get elapsedSeconds() {
@@ -422,6 +438,7 @@ export class PetModel {
       tool: entry.tool || '',
       waiting: this.pendingCount,
       alert,
+      notice: this.notice,
       sessionId: this.activeId,
       updatedAt: this.updatedAt,
     };

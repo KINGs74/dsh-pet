@@ -1,11 +1,12 @@
 {
   "name": "dsh-pet",
-  "version": "0.3.3",
+  "version": "0.3.6",
   "private": false,
   "description": "DSH 智能伙伴浮层：常驻桌面的 petdex 宠物，显示对话进展、任务结束提醒、全屏拖动、就地输入",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
+    "./client": "./src/client.js",
     ".": "./src/index.js",
     "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json",
@@ -27,6 +28,14 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
     }
   },
   "scripts": {

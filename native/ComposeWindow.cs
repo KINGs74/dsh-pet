@@ -2,6 +2,7 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -40,6 +41,23 @@ namespace DshPet
     {
         const int WmImeStartComposition = 0x010d;
         const int WmImeEndComposition = 0x010e;
+        const int EmSetCueBanner = 0x1501;
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr SendMessage(IntPtr hwnd, int message, IntPtr wParam, string lParam);
+
+        readonly string _cue;
+
+        public ComposeTextBox(string cue)
+        {
+            _cue = cue;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            SendMessage(Handle, EmSetCueBanner, new IntPtr(1), _cue);
+        }
 
         public bool Composing { get; private set; }
 
@@ -48,6 +66,11 @@ namespace DshPet
             if (message.Msg == WmImeStartComposition) Composing = true;
             base.WndProc(ref message);
             if (message.Msg == WmImeEndComposition) Composing = false;
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            return keyData == Keys.Enter || base.IsInputKey(keyData);
         }
 
         protected override void OnLostFocus(EventArgs e)
@@ -59,15 +82,20 @@ namespace DshPet
 
     sealed class ComposeWindow : Form
     {
+        public const int BaseHeight = 44;
+        const int FeedbackHeight = 30;
+        public event EventHandler RecordingChanged;
+        public bool Recording { get { return _voice != null; } }
+
         readonly Func<string, string, string> _loc;
         readonly Func<Task<ComposeTarget[]>> _load;
         readonly Func<string, string, string, Task<ComposeSubmitResult>> _submit;
         readonly ComposeTextBox _input;
         readonly ComboBox _targets;
-        readonly Label _targetLabel;
-        readonly Label _placeholder;
+        readonly ToolTip _tips = new ToolTip();
+        readonly string _refreshLabel;
         readonly Label _feedback;
-        readonly PillButton _refresh;
+        readonly PillButton _close;
         readonly PillButton _send;
         readonly PillButton _mic;
         readonly Timer _deactivateTimer;
@@ -80,13 +108,14 @@ namespace DshPet
         readonly Color _warning;
 
         ComposeTarget[] _choices = new ComposeTarget[0];
+        int _selectedTargetIndex = -1;
         string _requestId;
         string _requestText;
         string _requestTarget;
         bool _loadingTargets;
         bool _sending;
         bool _uncertain;
-        bool _shuttingDown;
+        bool _closingPermanently;
         bool _closed;
 
         VoiceInput _voice;
@@ -106,7 +135,8 @@ namespace DshPet
             _submit = submit;
             _startWithVoice = startVoice;
             _english = loc("zh", "en") == "en";
-            _scale = Math.Max(1f, bounds.Height / 224f);
+            _scale = Math.Max(1f, bounds.Height / (float)BaseHeight);
+            _refreshLabel = loc("刷新会话列表", "Refresh sessions");
 
             Text = loc("宠物草稿", "Pet draft");
             FormBorderStyle = FormBorderStyle.None;
@@ -126,68 +156,68 @@ namespace DshPet
             Color accent = dark ? Color.FromArgb(57, 101, 215) : Color.FromArgb(40, 89, 205);
             BackColor = _panel;
 
-            _targetLabel = NewLabel(_dim);
-            Controls.Add(_targetLabel);
-            _refresh = new PillButton(loc("刷新", "Refresh"), _panel, _text);
-            _refresh.Border = true;
-            _refresh.BorderColor = border;
-            _refresh.AccessibleName = loc("刷新会话列表", "Refresh session list");
-            _refresh.Click += delegate { LoadTargets(); };
-            Controls.Add(_refresh);
+
+            _close = new PillButton("×", _panel, _text);
+            _close.Font = new Font(Font.FontFamily, 12f);
+            _close.AccessibleName = loc("关闭输入框", "Close composer");
+            _tips.SetToolTip(_close, _close.AccessibleName);
+            _close.Click += delegate { Dismiss(); };
+            Controls.Add(_close);
 
             _targets = new ComboBox();
             _targets.DropDownStyle = ComboBoxStyle.DropDownList;
             _targets.BackColor = _panel;
             _targets.ForeColor = _text;
             _targets.MaxDropDownItems = 8;
-            _targets.AccessibleName = loc("发送到 DSH 会话", "Destination DSH session");
-            _targets.SelectedIndexChanged += delegate { UpdateActions(); };
+            _targets.DrawMode = DrawMode.OwnerDrawFixed;
+            _targets.DrawItem += DrawTarget;
+            _targets.Items.Add(_refreshLabel);
+            _targets.SelectionChangeCommitted += delegate
+            {
+                if (_targets.SelectedIndex == _choices.Length)
+                {
+                    _targets.SelectedIndex = _selectedTargetIndex;
+                    LoadTargets();
+                    return;
+                }
+                _selectedTargetIndex = _targets.SelectedIndex;
+                UpdateActions();
+                _input.Focus();
+            };
             _targets.DropDownClosed += delegate
             {
                 if (!ContainsFocus && !_closed) _deactivateTimer.Start();
             };
             Controls.Add(_targets);
 
-            _input = new ComposeTextBox();
-            _input.Multiline = true;
-            _input.AcceptsReturn = true;
+            _input = new ComposeTextBox(loc("写点什么…", "Message…"));
             _input.BorderStyle = BorderStyle.None;
             _input.BackColor = _panel;
             _input.ForeColor = _text;
-            _input.ScrollBars = ScrollBars.Vertical;
             _input.MaxLength = 6000;
             _input.AccessibleName = loc("消息草稿", "Message draft");
             _input.KeyDown += OnInputKeyDown;
             _input.TextChanged += delegate
             {
-                _placeholder.Visible = _input.TextLength == 0;
+                if (_feedback != null && _feedback.Text.Length > 0 && !Recording && !_sending && !_uncertain)
+                    Feedback("", false);
                 UpdateActions();
             };
             Controls.Add(_input);
 
-            _placeholder = NewLabel(_dim);
-            _placeholder.Text = loc("给智能伙伴写点什么…", "Message your companion…");
-            _placeholder.AccessibleRole = AccessibleRole.StaticText;
-            _placeholder.Click += delegate { _input.Focus(); };
-            Controls.Add(_placeholder);
-            _placeholder.BringToFront();
-
             _feedback = NewLabel(_dim);
             _feedback.TextAlign = ContentAlignment.MiddleLeft;
+            _feedback.Visible = false;
             Controls.Add(_feedback);
 
             _send = new PillButton(loc("发送", "Send"), accent, Color.White);
             _send.Click += delegate { Submit(); };
             Controls.Add(_send);
 
-            _mic = new PillButton(loc("听写", "Dictate"), _panel, _text);
+            _mic = new PillButton(loc("语音", "Voice"), _panel, _text);
             _mic.Border = true;
             _mic.BorderColor = border;
-            _mic.Click += delegate
-            {
-                if (_voice == null) StartVoice();
-                else StopVoice();
-            };
+            _mic.Click += delegate { ToggleVoice(); };
             Controls.Add(_mic);
 
             _deactivateTimer = new Timer();
@@ -195,8 +225,8 @@ namespace DshPet
             _deactivateTimer.Tick += delegate
             {
                 _deactivateTimer.Stop();
-                if (!ContainsFocus && !_targets.DroppedDown && _input.TextLength == 0 &&
-                    !_sending && _voice == null) Close();
+                if (Visible && !ContainsFocus && !_targets.DroppedDown && _input.TextLength == 0 &&
+                    !_sending && _voice == null) Dismiss();
             };
 
             Bounds = bounds;
@@ -232,22 +262,23 @@ namespace DshPet
         void LayoutChildren()
         {
             if (_mic == null) return;
-            int pad = S(12);
-            int width = Math.Max(1, ClientSize.Width - pad * 2);
-            int buttonH = S(28);
-            int buttonW = S(76);
-            int footerY = ClientSize.Height - pad - buttonH;
-            int statusH = S(39);
-            _targetLabel.SetBounds(pad, pad + S(3), Math.Max(1, width - buttonW - S(8)), S(20));
-            _refresh.SetBounds(ClientSize.Width - pad - buttonW, pad, buttonW, S(23));
-            _targets.SetBounds(pad, _refresh.Bottom + S(7), width, _targets.PreferredHeight);
-            int inputY = _targets.Bottom + S(12);
-            int inputH = Math.Max(S(22), footerY - inputY - statusH);
-            _input.SetBounds(pad + S(2), inputY, Math.Max(1, width - S(4)), inputH);
-            _placeholder.SetBounds(_input.Left + 1, _input.Top + 1, Math.Max(1, width - S(20)), S(23));
-            _feedback.SetBounds(pad, footerY - statusH, width, statusH - S(3));
-            _mic.SetBounds(ClientSize.Width - pad - buttonW * 2 - S(6), footerY, buttonW, buttonH);
-            _send.SetBounds(ClientSize.Width - pad - buttonW, footerY, buttonW, buttonH);
+            int pad = S(7);
+            int gap = S(3);
+            int rowH = S(30);
+            int rowY = (S(BaseHeight) - rowH) / 2;
+            int closeW = S(25);
+            int buttonW = S(45);
+            int comboH = _targets.PreferredHeight;
+            _close.SetBounds(ClientSize.Width - pad - closeW, rowY, closeW, rowH);
+            _send.SetBounds(_close.Left - gap - buttonW, rowY, buttonW, rowH);
+            _mic.SetBounds(_send.Left - gap - buttonW, rowY, buttonW, rowH);
+            _targets.SetBounds(pad, rowY + (rowH - comboH) / 2, S(91), comboH);
+            _targets.DropDownWidth = Math.Max(_targets.Width, S(330));
+            int inputX = _targets.Right + S(7);
+            int inputH = _input.PreferredHeight;
+            _input.SetBounds(inputX, rowY + (rowH - inputH) / 2,
+                Math.Max(1, _mic.Left - gap - inputX), inputH);
+            _feedback.SetBounds(pad, S(BaseHeight), Math.Max(1, ClientSize.Width - pad * 2), S(FeedbackHeight - 4));
 
             if (Width < 2 || Height < 2) return;
             using (GraphicsPath path = PillButton.RoundRect(new Rectangle(0, 0, Width, Height), S(12)))
@@ -256,6 +287,34 @@ namespace DshPet
                 Region = new Region(path);
                 if (previous != null) previous.Dispose();
             }
+        }
+
+        void DrawTarget(object sender, DrawItemEventArgs e)
+        {
+            if (e.Bounds.Width <= 0 || e.Bounds.Height <= 0) return;
+            bool edit = (e.State & DrawItemState.ComboBoxEdit) != 0;
+            bool highlighted = !edit && (e.State & DrawItemState.Selected) != 0;
+            Color background = highlighted ? SystemColors.Highlight : _panel;
+            Color foreground = highlighted ? SystemColors.HighlightText : _text;
+            string title = e.Index < 0 ? TargetPlaceholder() :
+                e.Index < _choices.Length ? TargetTitle(_choices[e.Index], !edit) : _refreshLabel;
+            using (SolidBrush brush = new SolidBrush(background)) e.Graphics.FillRectangle(brush, e.Bounds);
+            Rectangle bounds = Rectangle.Inflate(e.Bounds, -S(4), 0);
+            TextRenderer.DrawText(e.Graphics, title, e.Font, bounds, foreground,
+                TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter |
+                TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+            if (highlighted) e.DrawFocusRectangle();
+        }
+
+        string TargetPlaceholder()
+        {
+            return _loadingTargets ? _loc("读取会话…", "Loading…") :
+                _choices.Length == 0 ? _loc("无可用会话", "No sessions") : _loc("选择会话", "Choose session");
+        }
+
+        string TargetTitle(ComposeTarget target, bool showRecent)
+        {
+            return target.Title + (target.Recent && showRecent ? _loc("（最近活动）", " (recent)") : "");
         }
 
         protected override void OnResize(EventArgs e)
@@ -267,16 +326,22 @@ namespace DshPet
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            Activate();
-            _input.Focus();
+            FocusDraft();
             LoadTargets();
             if (_startWithVoice) StartVoice();
+        }
+
+        public void FocusDraft()
+        {
+            if (_closed || !Visible) return;
+            Activate();
+            _input.Focus();
         }
 
         protected override void OnDeactivate(EventArgs e)
         {
             base.OnDeactivate(e);
-            if (_deactivateTimer != null && !_closed) _deactivateTimer.Start();
+            if (_deactivateTimer != null && !_closed && Visible) _deactivateTimer.Start();
         }
 
         protected override void OnActivated(EventArgs e)
@@ -289,8 +354,8 @@ namespace DshPet
         {
             get
             {
-                int index = _targets.SelectedIndex;
-                return index >= 0 && index < _choices.Length ? _choices[index] : null;
+                return _selectedTargetIndex >= 0 && _selectedTargetIndex < _choices.Length ?
+                    _choices[_selectedTargetIndex] : null;
             }
         }
 
@@ -313,10 +378,12 @@ namespace DshPet
                     for (int i = 0; i < _choices.Length; i++)
                     {
                         ComposeTarget choice = _choices[i];
-                        _targets.Items.Add(choice.Title + (choice.Recent ? _loc("（最近活动）", " (recent)") : ""));
+                        _targets.Items.Add(TargetTitle(choice, true));
                         if (previousId != null ? previousId == choice.Id : choice.Recent && selected < 0) selected = i;
                     }
                     if (previousId == null && selected < 0 && _choices.Length == 1) selected = 0;
+                    _targets.Items.Add(_refreshLabel);
+                    _selectedTargetIndex = selected;
                     _targets.SelectedIndex = selected;
                 }
                 finally { _targets.EndUpdate(); }
@@ -336,19 +403,22 @@ namespace DshPet
         {
             if (_mic == null || _closed) return;
             ComposeTarget target = SelectedTarget;
-            _targetLabel.Text = _loadingTargets ? _loc("正在读取 DSH 会话…", "Loading DSH sessions…") :
-                _choices.Length == 0 ? _loc("没有可用的 DSH 会话", "No available DSH sessions") :
-                target == null ? _loc("请选择发送会话", "Choose a session") : _loc("发送到 DSH 会话", "Send to DSH session");
-            _targets.Enabled = !_sending && !_loadingTargets && _choices.Length != 0;
-            _refresh.Enabled = !_sending && !_loadingTargets;
+            string destination = target == null ? TargetPlaceholder() :
+                _loc("发送到：", "Send to: ") + TargetTitle(target, true);
+            _targets.AccessibleName = destination;
+            _tips.SetToolTip(_targets, destination);
+            _targets.Enabled = !_sending && !_loadingTargets;
+            _targets.Invalidate();
             _input.ReadOnly = _sending;
-            _mic.Enabled = !_sending && !_startingVoice && !_stoppingVoice;
-            _mic.Text = _startingVoice ? _loc("连接中…", "Starting…") :
-                _stoppingVoice ? _loc("转写中…", "Finishing…") :
-                _voice != null ? _loc("停止", "Stop") : _loc("听写", "Dictate");
+            _mic.Enabled = !_sending && !_stoppingVoice;
+            _mic.AccessibleName = _stoppingVoice ? _loc("正在转写", "Finishing dictation") :
+                Recording ? _loc("停止听写", "Stop dictation") : _loc("开始听写", "Start dictation");
+            _tips.SetToolTip(_mic, _mic.AccessibleName);
+            _mic.Text = Recording ? _loc("停止", "Stop") : _loc("语音", "Voice");
             _send.Enabled = !_loadingTargets && !_sending && target != null && _voice == null &&
                 !String.IsNullOrWhiteSpace(_input.Text);
-            _send.Text = _sending ? _loc("发送中…", "Sending…") : _loc("发送", "Send");
+            _send.Text = _sending ? "…" : _loc("发送", "Send");
+            _send.AccessibleName = _sending ? _loc("发送中", "Sending") : _loc("发送", "Send");
         }
 
         void OnInputKeyDown(object sender, KeyEventArgs e)
@@ -365,7 +435,7 @@ namespace DshPet
         {
             if (keyData == Keys.Escape && !_targets.DroppedDown && !_input.Composing)
             {
-                Close();
+                Dismiss();
                 return true;
             }
             return base.ProcessCmdKey(ref message, keyData);
@@ -386,7 +456,7 @@ namespace DshPet
             }
             if (_requestId == null || _requestTarget != target.Id || _requestText != draft)
             {
-                _requestId = Guid.NewGuid().ToString("N");
+                _requestId = Guid.NewGuid().ToString("D");
                 _requestTarget = target.Id;
                 _requestText = draft;
                 _uncertain = false;
@@ -408,6 +478,7 @@ namespace DshPet
             UpdateActions();
             if (result != null && result.Ok)
             {
+                _closingPermanently = true;
                 Close();
                 return;
             }
@@ -420,7 +491,7 @@ namespace DshPet
                     : _loc("发送失败，请重试。", "Send failed. Please retry.");
             }
             Feedback(message, true);
-            _input.Focus();
+            if (Visible && ContainsFocus) _input.Focus();
         }
 
         void Feedback(string message, bool warning)
@@ -428,6 +499,25 @@ namespace DshPet
             _feedback.ForeColor = warning ? _warning : _dim;
             _feedback.Text = message;
             _feedback.AccessibleName = message;
+            _tips.SetToolTip(_feedback, message);
+            bool hasFeedback = !String.IsNullOrWhiteSpace(message);
+            _feedback.Visible = hasFeedback;
+            int height = S(BaseHeight + (hasFeedback ? FeedbackHeight : 0));
+            if (Height != height) Height = height;
+        }
+
+        public void ToggleVoice()
+        {
+            if (_closed || _sending || _stoppingVoice) return;
+            if (!Recording) StartVoice();
+            else if (_startingVoice) FinishVoice("");
+            else StopVoice();
+        }
+
+        void RaiseRecordingChanged()
+        {
+            EventHandler handler = RecordingChanged;
+            if (handler != null) handler(this, EventArgs.Empty);
         }
 
         public async void StartVoice()
@@ -444,6 +534,7 @@ namespace DshPet
             voice.Completed += delegate(string error) { DispatchVoice(voice, delegate { FinishVoice(error); }); };
             UpdateActions();
             Feedback(_loc("正在打开麦克风…", "Opening microphone…"), false);
+            RaiseRecordingChanged();
             try
             {
                 await _voiceCleanup;
@@ -494,7 +585,7 @@ namespace DshPet
             string preview = partial.Length == 0 ? _recentVoiceSegment : partial;
             string status = _stoppingVoice ? _loc("正在完成转写", "Finishing dictation") :
                 _loc("正在听写", "Listening") + (_speechLanguage.Length == 0 ? "" : " (" + _speechLanguage + ")");
-            Feedback(preview.Length == 0 ? status : status + Environment.NewLine + preview, false);
+            Feedback(preview.Length == 0 ? status : status + " · " + preview, false);
         }
 
         void AcceptVoiceSegment(string text)
@@ -517,7 +608,7 @@ namespace DshPet
         {
             string recognized = _recognized.ToString();
             ReleaseVoice();
-            string prefix = _input.TextLength == 0 ? "" : Environment.NewLine;
+            string prefix = _input.TextLength == 0 ? "" : " ";
             int available = Math.Max(0, _input.MaxLength - _input.TextLength - prefix.Length);
             int insertLength = Math.Min(recognized.Length, available);
             if (insertLength > 0 && Char.IsHighSurrogate(recognized[insertLength - 1])) insertLength--;
@@ -545,6 +636,7 @@ namespace DshPet
             _stoppingVoice = false;
             if (voice != null)
             {
+                RaiseRecordingChanged();
                 Task previous = _voiceCleanup;
                 _voiceCleanup = Task.Run(async delegate
                 {
@@ -555,18 +647,33 @@ namespace DshPet
             }
         }
 
+        public void Dismiss()
+        {
+            if (_closed) return;
+            Close();
+        }
+
         public void CloseForShutdown()
         {
-            _shuttingDown = true;
+            _closingPermanently = true;
             Close();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (_sending && !_shuttingDown && e.CloseReason == CloseReason.UserClosing)
+            if (!_closingPermanently && e.CloseReason == CloseReason.UserClosing &&
+                (_sending || _uncertain || _input.TextLength > 0))
             {
                 e.Cancel = true;
-                Feedback(_loc("发送仍在进行，请稍候。", "The message is still being sent."), false);
+                _targets.DroppedDown = false;
+                Hide();
+                _deactivateTimer.Stop();
+                if (_voice != null)
+                {
+                    ReleaseVoice();
+                    UpdateActions();
+                    if (!_uncertain) Feedback(_loc("听写已取消，草稿已保留。", "Dictation canceled. Your draft is still here."), false);
+                }
             }
             base.OnFormClosing(e);
         }
@@ -575,6 +682,7 @@ namespace DshPet
         {
             _closed = true;
             _deactivateTimer.Dispose();
+            _tips.Dispose();
             ReleaseVoice();
             base.OnFormClosed(e);
         }

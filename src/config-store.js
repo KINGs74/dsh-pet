@@ -12,6 +12,7 @@ export const PETS_ROOT = join(homedir(), '.dsh', 'pets');
 
 /** 可持久化的配置项与默认值 */
 export const DEFAULT_CONFIG = Object.freeze({
+  visible: true, // 是否显示宠物浮层
   pet: '', // 当前宠物 id；空串表示「第一个可用宠物」
   scale: 0.55, // 宠物缩放，0.3 ~ 1.5
   bubble: true, // 是否显示气泡
@@ -46,6 +47,7 @@ export function normalizeConfig(raw) {
       ? { x: Math.round(Number(input.pos.x)), y: Math.round(Number(input.pos.y)) }
       : null;
   return {
+    visible: toBool(input.visible, DEFAULT_CONFIG.visible),
     pet: typeof input.pet === 'string' ? input.pet.trim() : DEFAULT_CONFIG.pet,
     scale: clampNumber(input.scale, SCALE_MIN, SCALE_MAX, DEFAULT_CONFIG.scale),
     bubble: toBool(input.bubble, DEFAULT_CONFIG.bubble),

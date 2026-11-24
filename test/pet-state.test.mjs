@@ -236,3 +236,44 @@ test('演练文案不会污染正在进行的对话气泡', () => {
   assert.ok(!snap.line1.includes('退出码 1'), `气泡被演练文案污染了：${snap.line1}`);
   assert.equal(snap.line1, '已把 provider 路由改好');
 });
+
+test('气泡收起后，下一轮开始仍可查看最新结束通知', () => {
+  const model = new PetModel();
+  const apply = (type, fields = {}) => model.applyEvent({
+    sessionId: 'root', isRoot: true, title: '验证浮层',
+    event: { type, ...fields },
+  });
+  apply('turn/start', { turn: 1 });
+  apply('assistant/message', { message: '第一轮已经完成' });
+  const finished = apply('turn/end');
+  assert.equal(finished.notice.id, finished.alert.id);
+  assert.match(finished.notice.body, /第一轮已经完成/);
+  model.ack(finished.alert.id);
+  const running = apply('turn/start', { turn: 2 });
+  assert.equal(running.alert, null);
+  assert.deepEqual(running.notice, finished.notice);
+});
+
+test('后台子会话的消息不混入当前任务的结束通知', () => {
+  const model = new PetModel();
+  const apply = (sessionId, isRoot, event) => model.applyEvent({ sessionId, isRoot, event });
+  apply('root', true, { type: 'turn/start', turn: 1 });
+  apply('root', true, { type: 'assistant/message', message: '根会话的结果' });
+  apply('child', false, { type: 'assistant/message', message: '后台子任务的消息' });
+  const finished = apply('root', true, { type: 'turn/end' });
+  assert.match(finished.notice.body, /根会话的结果/);
+  assert.doesNotMatch(finished.notice.body, /后台子任务/);
+});
+
+test('首次收到根会话结束时使用通知事件自身的轮次', () => {
+  const model = new PetModel();
+  const notice = model.applyEvent({
+    sessionId: 'root', isRoot: true,
+    event: { type: 'turn/end', data: { turn: 12, reason: { kind: 'completed' } } },
+  }).notice;
+  assert.equal(notice.id, 'root:12:completed');
+  const childOnly = new PetModel().applyEvent({
+    sessionId: 'child', isRoot: false, event: { type: 'turn/end' },
+  });
+  assert.equal(childOnly.notice, null);
+});

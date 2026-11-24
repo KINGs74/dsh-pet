@@ -7,7 +7,8 @@
 // 顶层窗口实现。这里用 .NET Framework 自带的 csc.exe 现场编译一个几百行的
 // WinForms 分层窗口，不需要用户装编译环境。
 import { spawn } from 'node:child_process';
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const CSC_PATHS = [
@@ -52,8 +53,12 @@ export async function findCsc() {
   return '';
 }
 
-export function run(cmd, args, { timeoutMs = 120_000, cwd } = {}) {
+export function run(cmd, args, { timeoutMs = 120_000, cwd, signal } = {}) {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ ok: false, code: -1, out: '', err: 'Run aborted' });
+      return;
+    }
     let out = '';
     let err = '';
     let child;
@@ -63,20 +68,25 @@ export function run(cmd, args, { timeoutMs = 120_000, cwd } = {}) {
       resolve({ ok: false, code: -1, out: '', err: String(error?.message ?? error) });
       return;
     }
-    const timer = setTimeout(() => {
+    const kill = () => {
       try {
         child.kill();
       } catch {}
-    }, timeoutMs);
+    };
+    const timer = setTimeout(kill, timeoutMs);
+    signal?.addEventListener('abort', kill, { once: true });
+    const finish = (result) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', kill);
+      resolve(result);
+    };
     child.stdout?.on('data', (chunk) => (out += chunk));
     child.stderr?.on('data', (chunk) => (err += chunk));
     child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({ ok: false, code: -1, out, err: String(error?.message ?? error) });
+      finish({ ok: false, code: -1, out, err: String(error?.message ?? error) });
     });
     child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ ok: code === 0, code: code ?? -1, out, err });
+      finish({ ok: code === 0, code: code ?? -1, out, err });
     });
   });
 }
@@ -119,7 +129,8 @@ export async function collectSources(nativeDir) {
  * 编译原生浮层。失败不抛异常：返回 { ok:false, message }，由调用方把
  * overlay=unavailable 发给浮层/日志，绝不影响 DSH 本体。
  */
-export async function buildOverlay({ nativeDir, exePath, log = () => {}, force = false }) {
+export async function buildOverlay({ nativeDir, exePath, log = () => {}, force = false, signal }) {
+  signal?.throwIfAborted();
   const csc = await findCsc();
   if (!csc) return { ok: false, message: '找不到 csc.exe（需要 .NET Framework 4.x）' };
   const collected = await collectSources(nativeDir);
@@ -134,11 +145,12 @@ export async function buildOverlay({ nativeDir, exePath, log = () => {}, force =
 
   const manifestPath = collected.manifestPath;
   const speechDll = await findSpeechDll();
+  const tempExe = `${exePath}.${randomUUID()}.tmp.exe`;
   const args = [
     '/nologo',
     '/target:winexe',
     '/optimize+',
-    `/out:${exePath}`,
+    `/out:${tempExe}`,
     `/win32manifest:${manifestPath}`,
     '/r:System.dll',
     '/r:System.Drawing.dll',
@@ -153,14 +165,21 @@ export async function buildOverlay({ nativeDir, exePath, log = () => {}, force =
   for (const source of collected.sources) args.push(source);
 
   await mkdir(join(exePath, '..'), { recursive: true });
-  const result = await run(csc, args);
-  if (!result.ok) {
-    const message = `编译失败：${(result.err || result.out || '').trim().split('\n').slice(0, 4).join(' ')}`;
-    log(message);
-    return { ok: false, message };
+  try {
+    signal?.throwIfAborted();
+    const result = await run(csc, args, { signal });
+    signal?.throwIfAborted();
+    if (!result.ok) {
+      const message = `编译失败：${(result.err || result.out || '').trim().split('\n').slice(0, 4).join(' ')}`;
+      log(message);
+      return { ok: false, message };
+    }
+    await rename(tempExe, exePath);
+    log(`浮层已编译 → ${exePath}`);
+    return { ok: true, message: '已编译' };
+  } finally {
+    await rm(tempExe, { force: true }).catch(() => {});
   }
-  log(`浮层已编译 → ${exePath}`);
-  return { ok: true, message: '已编译' };
 }
 
 /**
@@ -181,6 +200,9 @@ export class OverlaySupervisor {
     this.child = null;
     this.restarts = 0;
     this.stopping = false;
+    this.generation = 0;
+    this.pendingStart = null;
+    this.pendingStop = null;
     this.timer = null;
     this.state = 'stopped'; // stopped | starting | running | unavailable
     this.lastError = '';
@@ -196,14 +218,31 @@ export class OverlaySupervisor {
 
   async start() {
     if (this.child) return;
+    if (this.pendingStart) return this.pendingStart;
     this.stopping = false;
-    if (!(await this.available())) {
+    const pending = this.#start(this.generation);
+    this.pendingStart = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.pendingStart === pending) this.pendingStart = null;
+    }
+  }
+
+  async #start(generation) {
+    const cancelled = () => this.stopping || generation !== this.generation;
+    if (this.pendingStop) await this.pendingStop;
+    if (cancelled()) return;
+    const available = await this.available();
+    if (cancelled()) return;
+    if (!available) {
       this.state = 'unavailable';
       this.lastError = '缺少 PetOverlay.exe';
       this.log('浮层不可用：缺少可执行文件');
       return;
     }
     await mkdir(join(this.logFile, '..'), { recursive: true });
+    if (cancelled()) return;
     this.state = 'starting';
     const args = ['--host', this.host, '--token', this.token, '--log', this.logFile, '--prefix', this.prefix];
     if (this.dshPid) args.push('--dsh-pid', String(this.dshPid));
@@ -219,6 +258,7 @@ export class OverlaySupervisor {
     this.log(`浮层已启动 pid=${child.pid} host=${this.host}`);
 
     child.on('error', (error) => {
+      if (this.child !== child) return;
       this.lastError = String(error?.message ?? error);
       this.log(`浮层启动失败：${this.lastError}`);
       this.state = 'unavailable';
@@ -226,16 +266,13 @@ export class OverlaySupervisor {
     });
 
     child.on('exit', (code, signal) => {
+      if (this.child !== child) return;
       const lived = this.startedAt ? Date.now() - this.startedAt : 0;
       this.child = null;
       this.startedAt = 0;
       // 稳定跑过 30 秒再掉线，不算「连续重启」——否则一整天里偶发两三次退出就会把配额耗尽
       if (lived > 30_000) this.restarts = 0;
       this.log(`浮层退出 code=${code} signal=${signal ?? ''}（存活 ${Math.round(lived / 1000)}s）`);
-      if (this.stopping) {
-        this.state = 'stopped';
-        return;
-      }
       if (code === 0) {
         // 正常退出（例如宿主长时间不可达后自清理）：不重启，等下一次宿主事件
         this.state = 'stopped';
@@ -251,6 +288,7 @@ export class OverlaySupervisor {
       this.state = 'starting';
       this.timer = setTimeout(() => {
         this.timer = null;
+        if (cancelled()) return;
         this.start().catch((error) => this.log(`浮层重启失败：${error?.message ?? error}`));
       }, 1500);
       this.timer.unref?.();
@@ -261,7 +299,10 @@ export class OverlaySupervisor {
    * 手动重启（/pet restart 用）：清空连续重启计数，再拉一次。
    */
   async restart() {
-    await this.stop();
+    const stopping = this.stop();
+    const generation = this.generation;
+    await stopping;
+    if (generation !== this.generation) return this.status();
     this.restarts = 0;
     this.lastError = '';
     this.state = 'stopped';
@@ -271,6 +312,8 @@ export class OverlaySupervisor {
 
   async stop() {
     this.stopping = true;
+    this.generation += 1;
+    this.pendingStart = null;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -278,7 +321,16 @@ export class OverlaySupervisor {
     const child = this.child;
     this.child = null;
     this.state = 'stopped';
-    if (!child?.pid) return;
+    if (child?.pid) this.pendingStop = this.#stopChild(child);
+    const pending = this.pendingStop;
+    try {
+      await pending;
+    } finally {
+      if (this.pendingStop === pending) this.pendingStop = null;
+    }
+  }
+
+  async #stopChild(child) {
     const pid = child.pid;
     try {
       child.kill();

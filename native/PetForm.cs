@@ -6,10 +6,10 @@
 //   · 不占任务栏、不抢焦点、任何窗口之上（包括全屏视频与最小化的 DSH）；
 //   · 拖动位置算的是屏幕坐标，天然不受 DSH 面板/窗口裁剪。
 //
-// 交互（v0.2）：
+// 交互：
 //   单击    → 有结束提醒先确认，然后打开/唤起 DSH（含"隐藏到托盘"和"最小化"两种状态）
 //   拖动    → 放到屏幕任意位置，松手即持久化
-//   悬停    → 头顶浮出 ✎ / 🎤 小胶囊，移开 300ms 自动收起
+//   悬停    → 显示写入、语音和气泡按钮，移开 300ms 后收起
 //   双击    → 打开/唤起 DSH
 //   右键    → 自绘圆角半透明菜单
 using System;
@@ -57,18 +57,18 @@ namespace DshPet
         // —— 交互状态 ——
         bool _dragging;
         bool _dragMoved;
-        long _dragPushAt;
         Point _dragStartScreen;
-        Point _dragStartWindow;
+        Point _dragStartAnchor;
         bool _hover;
         DateTime _hoverLostAt = DateTime.UtcNow;
-        int _hoverButton;
-        Point _lastMouse;
+        PetAction _hoverAction;
 
-        // 动作条（✎/🎤）单独一行、宠物下方、没有容器；这三个矩形都由 Relayout 算
+        // 三个动作按钮独立命中，安静状态的小标记也可以单独打开气泡。
         Rectangle _actionsRect = Rectangle.Empty;
         Rectangle _btnCompose = Rectangle.Empty;
         Rectangle _btnVoice = Rectangle.Empty;
+        Rectangle _btnFold = Rectangle.Empty;
+        Rectangle _restIndicator = Rectangle.Empty;
         Rectangle _bubbleRect = Rectangle.Empty;
         Rectangle _petRect = Rectangle.Empty;
         int _petBottomOffset;   // 宠物底边在窗口内的高度，锚点靠它保持"脚不动"
@@ -79,6 +79,29 @@ namespace DshPet
         string _contentKey = "";
         DateTime _alertAt = DateTime.UtcNow;
         string _lastAlertId = "";
+        BubbleDisplay _bubbleDisplay;
+        string _lastObservedNoticeId = "";
+        int _unreadCount;
+        BubbleNotice _latestUnread;
+        BubbleNotice _reviewNotice;
+        DateTime _reviewUntil;
+
+        enum BubbleDisplay { Automatic, Collapsed, Expanded }
+        enum PetAction { None, Compose, Voice, ToggleBubble, FoldBubble, ReviewNotice }
+
+        sealed class BubbleNotice
+        {
+            public readonly string Kind;
+            public readonly string Title;
+            public readonly string Body;
+
+            public BubbleNotice(string kind, string title, string body)
+            {
+                Kind = kind;
+                Title = title;
+                Body = body;
+            }
+        }
         
 
         // —— 连接与生命周期 ——
@@ -99,18 +122,22 @@ namespace DshPet
         int _serverPosY = int.MinValue;
 
         float _dpi = 1f;
+        bool _dpiLayoutQueued;
 
-        readonly Font _titleFont;
-        readonly Font _bodyFont;
-        readonly Font _smallFont;
-        readonly Font _iconFont;
+        Font _titleFont;
+        Font _bodyFont;
+        Font _smallFont;
+        Font _iconFont;
+        float _fontScale;
         readonly Graphics _measure;
+        OverlayPalette _palette = OverlayPalette.Current();
 
         System.Windows.Forms.Timer _animTimer;
         System.Windows.Forms.Timer _hoverTimer;
 
         OverlayMenu _menu;
         ComposeWindow _composeWindow;
+        bool _petHidden;
 
         public PetForm(Opts opts)
         {
@@ -131,10 +158,7 @@ namespace DshPet
 
             _measure = Graphics.FromHwnd(IntPtr.Zero);
             _dpi = Math.Max(1f, _measure.DpiX / 96f);
-            _titleFont = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold, GraphicsUnit.Point);
-            _bodyFont = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point);
-            _smallFont = new Font("Microsoft YaHei UI", 8f, FontStyle.Regular, GraphicsUnit.Point);
-            _iconFont = new Font("Segoe MDL2 Assets", 11f, FontStyle.Regular, GraphicsUnit.Point);
+            EnsureTypography();
 
             _animTimer = new System.Windows.Forms.Timer();
             _animTimer.Interval = 80;
@@ -156,7 +180,7 @@ namespace DshPet
                 _closing = true;
                 _animTimer.Stop();
                 _hoverTimer.Stop();
-                if (IsComposing) _composeWindow.CloseForShutdown();
+                if (_composeWindow != null && !_composeWindow.IsDisposed) _composeWindow.CloseForShutdown();
                 CloseMenu();
             };
         }
@@ -189,6 +213,37 @@ namespace DshPet
             return (float)(value * _dpi);
         }
 
+        void EnsureTypography()
+        {
+            if (_fontScale == _dpi) return;
+            DisposeTypography();
+            _titleFont = new Font("Microsoft YaHei UI", 13f * _dpi, FontStyle.Bold, GraphicsUnit.Pixel);
+            _bodyFont = new Font("Microsoft YaHei UI", 12f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel);
+            _smallFont = new Font("Microsoft YaHei UI", 11f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel);
+            _iconFont = new Font("Segoe MDL2 Assets", 14.5f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel);
+            _fontScale = _dpi;
+        }
+
+        void DisposeTypography()
+        {
+            if (_titleFont == null) return;
+            _titleFont.Dispose();
+            _bodyFont.Dispose();
+            _smallFont.Dispose();
+            _iconFont.Dispose();
+            _titleFont = null;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                DisposeTypography();
+                if (_measure != null) _measure.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
         int PetW { get { return Math.Max(32, (int)Math.Round(_state.FrameW * _state.Scale)); } }
         int PetH { get { return Math.Max(32, (int)Math.Round(_state.FrameH * _state.Scale)); } }
         int BubbleW { get { return S(300); } }
@@ -212,50 +267,124 @@ namespace DshPet
 
         bool BubbleVisible()
         {
-            if (FocusHintVisible) return true;
-            if (!_state.Bubble) return false;
-            DateTime now = DateTime.UtcNow;
-            if (_state.AlertId.Length > 0)
-            {
-                int alertMs = _state.AlertMs > 0 ? _state.AlertMs : 30000;
-                if ((now - _alertAt).TotalMilliseconds < alertMs) return true;
-            }
-            if (_state.BubbleMs <= 0) return HasBubbleContent();
-            if (!HasBubbleContent()) return false;
-            return (now - _contentAt).TotalMilliseconds < _state.BubbleMs;
+            return FocusHintVisible || LiveBubbleVisible(_state);
         }
 
-        bool HasBubbleContent()
+        bool LiveBubbleVisible(PetState state)
         {
-            return _state.Title.Length > 0 || _state.Line1.Length > 0 || _state.AlertId.Length > 0 || _state.Toast.Length > 0;
+            if (_bubbleDisplay == BubbleDisplay.Collapsed) return false;
+            if (_bubbleDisplay == BubbleDisplay.Expanded) return true;
+            if (!state.Bubble) return false;
+
+            DateTime now = DateTime.UtcNow;
+            if (state.AlertId.Length > 0)
+            {
+                int alertMs = state.AlertMs > 0 ? state.AlertMs : 30000;
+                if ((now - _alertAt).TotalMilliseconds < alertMs) return true;
+            }
+            if (state.Title.Length == 0 && state.Line1.Length == 0 && state.AlertId.Length == 0 && state.Toast.Length == 0)
+                return false;
+            return state.BubbleMs <= 0 || (now - _contentAt).TotalMilliseconds < state.BubbleMs;
+        }
+
+        bool RestIndicatorVisible { get { return _bubbleDisplay == BubbleDisplay.Collapsed || _unreadCount > 0; } }
+
+        BubbleNotice ReviewedNotice
+        {
+            get { return DateTime.UtcNow < _reviewUntil ? _reviewNotice : null; }
+        }
+
+        void FoldBubble()
+        {
+            _bubbleDisplay = BubbleDisplay.Collapsed;
+            _focusHintUntil = DateTime.MinValue;
+            _reviewNotice = null;
+            Relayout(false);
+        }
+
+        void ExpandBubble()
+        {
+            _bubbleDisplay = BubbleDisplay.Expanded;
+            _focusHintUntil = DateTime.MinValue;
+            _reviewNotice = _latestUnread;
+            _reviewUntil = DateTime.UtcNow.AddSeconds(6);
+            _latestUnread = null;
+            _unreadCount = 0;
+            Relayout(false);
+        }
+
+        void ConfigureAutomaticBubble(string duration)
+        {
+            _bubbleDisplay = BubbleDisplay.Automatic;
+            _reviewNotice = null;
+            _focusHintUntil = DateTime.MinValue;
+            _state.Bubble = duration != null;
+            Dictionary<string, string> change = new Dictionary<string, string>();
+            change["bubble"] = _state.Bubble ? "1" : "0";
+            if (_state.Bubble)
+            {
+                change["bubbleMs"] = duration;
+                _state.BubbleMs = int.Parse(duration, System.Globalization.CultureInfo.InvariantCulture);
+                _contentAt = DateTime.UtcNow;
+            }
+            Post("/config", change);
+            Relayout(false);
+        }
+
+        void ObserveNotifications(PetState state)
+        {
+            bool liveVisible = !_petHidden && state.Visible && !FocusHintVisible && LiveBubbleVisible(state);
+            string noticeId = state.NoticeId.Length > 0 ? state.NoticeId : state.AlertId;
+            if (noticeId.Length > 0 && noticeId != _lastObservedNoticeId)
+            {
+                _lastObservedNoticeId = noticeId;
+                if (liveVisible && state.AlertId == noticeId) _reviewNotice = null;
+                else
+                {
+                    string kind = state.NoticeKind.Length > 0 ? state.NoticeKind : state.AlertKind;
+                    if (kind.Length == 0) kind = "completed";
+                    string body = state.NoticeBody.Length > 0 ? state.NoticeBody : state.AlertText;
+                    RecordUnread(new BubbleNotice(kind, state.NoticeTitle, body), 1);
+                }
+            }
+
+            if (state.Status != "waiting") return;
+            int waiting = Math.Max(1, state.Waiting);
+            int previous = _state.Status == "waiting" && _state.SessionId == state.SessionId ? Math.Max(1, _state.Waiting) : 0;
+            if (waiting <= previous) return;
+            if (liveVisible) _reviewNotice = null;
+            else RecordUnread(new BubbleNotice("waiting", state.Title, state.Line1), waiting - previous);
+        }
+
+        void RecordUnread(BubbleNotice notice, int count)
+        {
+            _latestUnread = notice;
+            _unreadCount = Math.Min(100, _unreadCount + Math.Min(100, count));
         }
 
         void Relayout(bool force)
         {
+            EnsureTypography();
+            Point anchor = LayoutAnchor();
             bool showBubble = BubbleVisible();
             bool showActions = HoverVisible;
             int pad = S(6);
             int gap = S(6);
             int petW = PetW;
             int petH = PetH;
-            int actionsW = S(72);
             int actionsH = S(30);
-            int bubbleW = showBubble ? Math.Min(BubbleW, Math.Max(petW, S(210))) : 0;
+            int segmentW = S(34);
+            int actionsW = segmentW * 3;
+            int indicatorW = S(27);
+            int indicatorOffset = S(7);
+            int bubbleW = showBubble ? Math.Min(BubbleW, Math.Max(petW, S(224))) : 0;
             int bubbleH = showBubble ? MeasureBubble(bubbleW) : 0;
 
-            // 动作条默认在宠物下方的独立一行；宠物贴着屏幕底边放不下时翻到最上面（气泡之上），
-            // 这样贴边时按钮也不会被裁掉。
-            _actionsBelow = true;
-            if (showActions)
-            {
-                Point anchorPoint = new Point(_anchorX == int.MinValue ? 0 : _anchorX, _anchorY == int.MinValue ? 0 : _anchorY);
-                Screen screen = Screen.FromPoint(anchorPoint);
-                Rectangle area = screen != null ? screen.WorkingArea : Screen.PrimaryScreen.WorkingArea;
-                _actionsBelow = _anchorY == int.MinValue || area.Bottom - _anchorY >= actionsH + gap + pad;
-            }
+            _actionsBelow = !showActions || ActionsFitBelow(anchor);
 
-            int contentW = Math.Max(Math.Max(petW, bubbleW), showActions ? actionsW : 0);
-            int winW = contentW + pad * 2;
+            int petAndIndicatorW = RestIndicatorVisible ? petW + (indicatorW - indicatorOffset) * 2 : petW;
+            int contentW = Math.Max(Math.Max(petAndIndicatorW, bubbleW), showActions ? actionsW : 0);
+            int winW = Math.Max(S(80), contentW + pad * 2);
 
             int y = pad;
             if (showActions && !_actionsBelow)
@@ -279,6 +408,9 @@ namespace DshPet
             }
 
             _petRect = new Rectangle((winW - petW) / 2, y, petW, petH);
+            _restIndicator = RestIndicatorVisible
+                ? new Rectangle(_petRect.Right - indicatorOffset, y + S(4), indicatorW, S(21))
+                : Rectangle.Empty;
             y += petH;
 
             if (showActions && _actionsBelow)
@@ -289,57 +421,51 @@ namespace DshPet
             }
 
             int winH = y + pad;
-            if (winW < S(80)) winW = S(80);
-
-            // 两个按钮各 30×30，居中排在动作条里，中间留 10px —— 彼此分开，没有整体容器。
-            int btn = S(30);
-            int buttonsW = btn * 2 + S(10);
-            int left = _actionsRect.X + Math.Max(0, (_actionsRect.Width - buttonsW) / 2);
-            _btnCompose = new Rectangle(left, _actionsRect.Y, btn, actionsH);
-            _btnVoice = new Rectangle(left + btn + S(10), _actionsRect.Y, btn, actionsH);
+            _btnCompose = Rectangle.Empty;
+            _btnVoice = Rectangle.Empty;
+            _btnFold = Rectangle.Empty;
+            if (showActions)
+            {
+                _btnCompose = new Rectangle(_actionsRect.X, _actionsRect.Y, segmentW, actionsH);
+                _btnVoice = new Rectangle(_btnCompose.Right, _actionsRect.Y, segmentW, actionsH);
+                _btnFold = new Rectangle(_btnVoice.Right, _actionsRect.Y, segmentW, actionsH);
+            }
 
             _petBottomOffset = _petRect.Bottom;
 
-            bool sizeChanged = winW != Width || winH != Height;
-            if (sizeChanged || force)
-            {
+            if (_compose == null || winW != _compose.Width || winH != _compose.Height || force)
                 ResizeCompose(winW, winH);
-                Size = new Size(winW, winH);
-            }
 
-            ApplyAnchor(winW, winH);
-            Render();
+            RenderAt(LocationForAnchor(anchor, winW, winH));
+            _lastLayoutHash = LayoutHash();
         }
 
-        void ApplyAnchor(int winW, int winH)
+        Point LayoutAnchor()
         {
+            if (_dragging && _dragMoved) return DragAnchor(Cursor.Position);
             if (_anchorX == int.MinValue)
             {
                 Rectangle area = Screen.PrimaryScreen.WorkingArea;
                 _anchorX = area.Right - S(140);
                 _anchorY = area.Bottom - S(28);
             }
-            int x = _anchorX - winW / 2;
-            int y = _anchorY - _petBottomOffset;
-            Point target = ClampWindow(new Point(x, y), winW, winH);
-            if (Location != target) Location = target;
+            return new Point(_anchorX, _anchorY);
         }
 
-        /// <summary>窗口整体收进"离它最近的显示器"工作区：换分辨率/拔显示器后仍然看得见。</summary>
-        Point ClampWindow(Point p, int winW, int winH)
+        bool ActionsFitBelow(Point anchor)
         {
-            Rectangle area;
-            Screen screen = Screen.FromPoint(new Point(p.X + winW / 2, p.Y + winH / 2));
-            area = screen != null ? screen.WorkingArea : Screen.PrimaryScreen.WorkingArea;
+            Rectangle area = Screen.FromPoint(anchor).WorkingArea;
+            return area.Bottom - anchor.Y >= S(30) + S(6) * 2;
+        }
+
+        Point LocationForAnchor(Point anchor, int width, int height)
+        {
+            Rectangle area = Screen.FromPoint(anchor).WorkingArea;
             int margin = S(4);
-            int x = p.X;
-            int y = p.Y;
-            if (x < area.Left + margin) x = area.Left + margin;
-            if (y < area.Top + margin) y = area.Top + margin;
-            if (x + winW > area.Right - margin) x = area.Right - margin - winW;
-            if (y + winH > area.Bottom - margin) y = area.Bottom - margin - winH;
-            if (x < area.Left) x = area.Left;
-            if (y < area.Top) y = area.Top;
+            int x = anchor.X - width / 2;
+            int y = anchor.Y - _petBottomOffset;
+            x = Math.Max(area.Left, Math.Min(area.Right - margin - width, Math.Max(area.Left + margin, x)));
+            y = Math.Max(area.Top, Math.Min(area.Bottom - margin - height, Math.Max(area.Top + margin, y)));
             return new Point(x, y);
         }
 
@@ -349,25 +475,28 @@ namespace DshPet
             int padY = S(9);
             int inner = width - padX * 2;
             List<string> lines = WrapBody(BubbleBody(), inner, 3);
-            int titleH = LineHeight(_titleFont);
             int bodyH = lines.Count * LineHeight(_bodyFont);
             int footerH = BubbleFooter().Length > 0 ? LineHeight(_smallFont) : 0;
-            int h = padY * 2 + titleH;
-            if (lines.Count > 0) h += S(3) + bodyH;
-            if (footerH > 0) h += S(3) + footerH;
+            int h = padY * 2 + BubbleHeaderHeight();
+            if (lines.Count > 0) h += S(5) + bodyH;
+            if (footerH > 0) h += S(5) + footerH;
             return h;
         }
+
+        int BubbleHeaderHeight() { return Math.Max(S(19), LineHeight(_titleFont)); }
 
         string BubbleBody()
         {
             if (FocusHintVisible) return Localized("请从任务栏或托盘返回 DSH。", "Open DSH from the taskbar or system tray.");
+            BubbleNotice review = ReviewedNotice;
+            if (review != null) return review.Body;
             if (_state.AlertId.Length > 0) return _state.AlertText.Length > 0 ? _state.AlertText : _state.Line1;
             return _state.Line1;
         }
 
         string BubbleFooter()
         {
-            return FocusHintVisible ? "" : _state.Line2;
+            return FocusHintVisible || ReviewedNotice != null ? "" : _state.Line2;
         }
 
         int LineHeight(Font font)
@@ -534,19 +663,23 @@ namespace DshPet
 
         void Render()
         {
+            RenderAt(Location);
+        }
+
+        void RenderAt(Point destination)
+        {
             if (_composeInProgress) return;
             // 首次 Relayout 可能早于 ResizeCompose，这时还没有合成位图
             if (_compose == null || _composeG == null) return;
             _composeInProgress = true;
             try
             {
-                int w = _compose.Width;
-                int h = _compose.Height;
                 _composeG.Clear(Color.Transparent);
                 DrawActions(_composeG);
                 DrawBubble(_composeG);
                 DrawPet(_composeG);
-                PushLayered();
+                DrawRestIndicator(_composeG);
+                PushLayered(destination);
             }
             catch (Exception error)
             {
@@ -560,113 +693,183 @@ namespace DshPet
 
         bool _composeInProgress;
 
-        /// <summary>
-        /// 动作条：宠物下方独立一行，**不画任何容器**——没有胶囊底、没有描边，
-        /// 所以宠物周围不会出现"最外面那个框"。平时整条不可见，悬停才淡入。
-        /// </summary>
         void DrawActions(Graphics g)
         {
             if (!HoverVisible || _actionsRect.IsEmpty) return;
-            DrawButtonPlate(g, _btnCompose, _hoverButton == 1);
-            DrawButtonPlate(g, _btnVoice, _hoverButton == 2);
-            Color ink1 = _hoverButton == 1 ? Color.FromArgb(28, 38, 68) : Color.FromArgb(58, 70, 104);
-            Color ink2 = _hoverButton == 2 ? Color.FromArgb(28, 38, 68) : Color.FromArgb(58, 70, 104);
-            DrawIconGlyph(g, _btnCompose, "\uE70F", ink1);
-            DrawIconGlyph(g, _btnVoice, "\uE720", ink2);
-        }
-
-        /// <summary>
-        /// 按钮底板：只是一枚很淡的圆形玻璃，不构成"外层框"。平时更淡，指针压上去才实一点。
-        /// </summary>
-        void DrawButtonPlate(Graphics g, Rectangle r, bool hot)
-        {
-            int d = Math.Min(r.Width, r.Height) - S(2);
-            Rectangle circle = new Rectangle(r.X + (r.Width - d) / 2, r.Y + (r.Height - d) / 2, d, d);
-            using (GraphicsPath path = new GraphicsPath())
+            FillPlate(g, _actionsRect, _actionsRect.Height / 2, _palette.Surface);
+            using (Pen divider = new Pen(_palette.Line, Math.Max(1f, S(0.7f))))
             {
-                path.AddEllipse(circle);
-                using (SolidBrush shadow = new SolidBrush(Color.FromArgb(hot ? 22 : 12, 24, 28, 44)))
-                {
-                    g.TranslateTransform(0f, S(1));
-                    g.FillPath(shadow, path);
-                    g.TranslateTransform(0f, -S(1));
-                }
-                using (SolidBrush plate = new SolidBrush(Color.FromArgb(hot ? 255 : 236, 255, 255, 255)))
-                {
-                    g.FillPath(plate, path);
-                }
+                int top = _actionsRect.Top + S(8);
+                int bottom = _actionsRect.Bottom - S(8);
+                g.DrawLine(divider, _btnCompose.Right, top, _btnCompose.Right, bottom);
+                g.DrawLine(divider, _btnVoice.Right, top, _btnVoice.Right, bottom);
+            }
+
+            bool expanded = BubbleVisible();
+            bool recording = IsComposing && _composeWindow.Recording;
+            Color writeInk = DrawActionSegment(g, _btnCompose, PetAction.Compose, IsComposing);
+            Color voiceInk = DrawActionSegment(g, _btnVoice, PetAction.Voice, recording);
+            Color foldInk = DrawActionSegment(g, _btnFold, PetAction.ToggleBubble, expanded);
+            DrawIconGlyph(g, _btnCompose, "\uE70F", writeInk);
+            if (recording)
+            {
+                int size = S(10);
+                Rectangle stop = new Rectangle(_btnVoice.Left + (_btnVoice.Width - size) / 2,
+                    _btnVoice.Top + (_btnVoice.Height - size) / 2, size, size);
+                FillPlate(g, stop, S(2), _palette.Failure);
+            }
+            else DrawIconGlyph(g, _btnVoice, "\uE720", voiceInk);
+
+            Rectangle messageIcon = _btnFold;
+            if (_unreadCount > 0) messageIcon.Offset(-S(4), S(2));
+            if (expanded) DrawDownChevron(g, messageIcon, foldInk);
+            else DrawBubbleGlyph(g, messageIcon, foldInk);
+            if (_unreadCount > 0)
+            {
+                int width = _unreadCount > 99 ? S(23) : _unreadCount >= 10 ? S(19) : S(15);
+                Rectangle badge = new Rectangle(_btnFold.Right - width - S(3), _btnFold.Top + S(2), width, S(13));
+                DrawNoticeCount(g, badge);
             }
         }
 
-        RectangleF IconBox(Rectangle r, int size)
+        Color DrawActionSegment(Graphics g, Rectangle bounds, PetAction action, bool selected)
         {
-            float d = S(size);
-            return new RectangleF(r.X + (r.Width - d) / 2f, r.Y + (r.Height - d) / 2f, d, d);
+            bool hot = _hoverAction == action;
+            if (hot || selected)
+            {
+                Rectangle highlight = Rectangle.Inflate(bounds, -S(3), -S(3));
+                FillPlate(g, highlight, S(8), selected ? _palette.Selected : _palette.Hover);
+            }
+            return hot || selected ? _palette.Accent : _palette.Text;
         }
 
-        /// <summary>
-        /// 图标字形：Segoe MDL2 Assets 是 Windows 自带的图标字体（✎ = E70F，麦克风 = E720），
-        /// 小尺寸下比自绘路径锐利，而且不会像 emoji 那样上色。
-        /// </summary>
-        void DrawIconGlyph(Graphics g, Rectangle r, string glyph, Color ink)
+        void DrawRestIndicator(Graphics g)
         {
-            StringFormat fmt = new StringFormat();
-            fmt.Alignment = StringAlignment.Center;
-            fmt.LineAlignment = StringAlignment.Center;
-            fmt.FormatFlags = StringFormatFlags.NoWrap;
-            using (SolidBrush brush = new SolidBrush(ink))
+            if (_restIndicator.IsEmpty) return;
+            Rectangle plate = Rectangle.Inflate(_restIndicator, -S(1), -S(1));
+            if (_unreadCount > 0 && (!HoverVisible || _hoverAction == PetAction.ReviewNotice))
             {
-                g.DrawString(glyph, _iconFont, brush, r, fmt);
+                DrawNoticeCount(g, plate);
+                return;
             }
-            fmt.Dispose();
+            bool hot = _hoverAction == PetAction.ReviewNotice;
+            FillPlate(g, plate, plate.Height / 2, hot ? _palette.Selected : _palette.Surface);
+            DrawBubbleGlyph(g, plate, _palette.Accent);
+        }
+
+        void DrawNoticeCount(Graphics g, Rectangle bounds)
+        {
+            string count = _unreadCount > 99 ? "99+" : _unreadCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            FillPlate(g, bounds, bounds.Height / 2, _palette.Marker);
+            using (SolidBrush text = new SolidBrush(_palette.MarkerText))
+            using (StringFormat format = StringFormat.GenericTypographic)
+            {
+                format.Alignment = StringAlignment.Center;
+                format.LineAlignment = StringAlignment.Center;
+                format.FormatFlags |= StringFormatFlags.NoWrap;
+                g.DrawString(count, _smallFont, text, bounds, format);
+            }
+        }
+
+        void FillPlate(Graphics g, Rectangle bounds, int radius, Color color)
+        {
+            using (GraphicsPath path = Rounded(bounds, radius))
+            using (SolidBrush fill = new SolidBrush(color))
+                g.FillPath(fill, path);
+        }
+
+        Pen IconStroke(Color color)
+        {
+            Pen stroke = new Pen(color, S(1.55f));
+            stroke.LineJoin = LineJoin.Round;
+            stroke.StartCap = LineCap.Round;
+            stroke.EndCap = LineCap.Round;
+            return stroke;
+        }
+
+        void DrawDownChevron(Graphics g, Rectangle bounds, Color color)
+        {
+            float x = bounds.Left + bounds.Width / 2f;
+            float y = bounds.Top + bounds.Height / 2f;
+            using (Pen stroke = IconStroke(color))
+                g.DrawLines(stroke, new PointF[] {
+                    new PointF(x - S(4.5f), y - S(2f)), new PointF(x, y + S(2.5f)), new PointF(x + S(4.5f), y - S(2f))
+                });
+        }
+
+        void DrawBubbleGlyph(Graphics g, Rectangle bounds, Color color)
+        {
+            float x = bounds.Left + bounds.Width / 2f;
+            float y = bounds.Top + bounds.Height / 2f;
+            using (Pen stroke = IconStroke(color))
+            using (GraphicsPath body = new GraphicsPath())
+            {
+                body.AddPolygon(new PointF[] {
+                    new PointF(x - S(6f), y - S(5f)), new PointF(x + S(6f), y - S(5f)),
+                    new PointF(x + S(6f), y + S(3f)), new PointF(x - S(1f), y + S(3f)),
+                    new PointF(x - S(4f), y + S(6f)), new PointF(x - S(4f), y + S(3f)),
+                    new PointF(x - S(6f), y + S(3f))
+                });
+                g.DrawPath(stroke, body);
+            }
+        }
+
+        void DrawIconGlyph(Graphics g, Rectangle bounds, string glyph, Color color)
+        {
+            using (StringFormat format = new StringFormat())
+            using (SolidBrush ink = new SolidBrush(color))
+            {
+                format.Alignment = StringAlignment.Center;
+                format.LineAlignment = StringAlignment.Center;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+                g.DrawString(glyph, _iconFont, ink, bounds, format);
+            }
         }
 
         void DrawBubble(Graphics g)
         {
             if (!BubbleVisible() || _bubbleRect.IsEmpty) return;
             bool focusHint = FocusHintVisible;
-            bool alert = !focusHint && _state.AlertId.Length > 0;
-            bool success = _state.IsSuccess;
-            Rectangle r = _bubbleRect;
+            BubbleNotice review = focusHint ? null : ReviewedNotice;
+            bool waiting = !focusHint && (review != null ? review.Kind == "waiting" : _state.Status == "waiting");
+            bool alert = !focusHint && (review != null ? !waiting : _state.AlertId.Length > 0);
+            bool success = review != null ? review.Kind == "completed" : _state.IsSuccess;
+            Rectangle bounds = _bubbleRect;
+            FillPlate(g, bounds, S(15), _hoverAction == PetAction.FoldBubble ? _palette.Hover : _palette.Surface);
 
-            Color bg = alert
-                ? (success ? Color.FromArgb(250, 251, 243, 226) : Color.FromArgb(250, 253, 236, 233))
-                : Color.FromArgb(244, 252, 252, 254);
-
-            // 外观：不要"框"。0.3 的三层圆角投影在浅色聊天区上就是一圈灰边，用户看到的就是它；
-            // 提醒态的 1px 彩色描边同样是一圈框。现在只留一层扁平填充，成功/失败靠填充色
-            // 和标题里的 ✔ / ✕ 区分，边缘不再有任何描边或投影。
-            using (GraphicsPath path = Rounded(r, S(12)))
-            using (SolidBrush back = new SolidBrush(bg))
-            {
-                g.FillPath(back, path);
-            }
-
-            int padX = S(12);
-            int padY = S(9);
-            int y = r.Y + padY;
+            int x = bounds.X + S(12);
+            int y = bounds.Y + S(9);
+            int width = bounds.Width - S(12) * 2;
+            int headerHeight = BubbleHeaderHeight();
+            int markerSize = S(18);
+            Rectangle marker = new Rectangle(x, y + (headerHeight - markerSize) / 2, markerSize, markerSize);
+            DrawBubbleStatus(g, marker, alert, success, waiting || focusHint);
 
             string title = alert ? (success ? Localized("任务已经结束", "Task finished") : Localized("任务执行失败", "Task failed")) : _state.Title;
             if (!alert && _state.Toast.Length > 0) title = _state.Toast;
+            if (review != null)
+                title = review.Title.Length > 0 ? review.Title
+                    : waiting ? Localized("等待你的确认", "Waiting for your confirmation") : title;
             if (focusHint) title = Localized("未能切到 DSH", "Could not switch to DSH");
             if (title.Length == 0) title = Localized("智能伙伴", "Companion");
-            if (alert) title = (success ? "✔ " : "✕ ") + title;
-            title = ClipText(title, _titleFont, r.Width - padX * 2);
-            using (SolidBrush ink = new SolidBrush(alert ? (success ? Color.FromArgb(150, 96, 20) : Color.FromArgb(160, 52, 40)) : Color.FromArgb(34, 38, 48)))
-            {
-                g.DrawString(title, _titleFont, ink, new PointF(r.X + padX, y));
-            }
-            y += LineHeight(_titleFont);
 
-            List<string> lines = WrapBody(BubbleBody(), r.Width - padX * 2, 3);
+            int titleX = marker.Right + S(7);
+            int titleW = Math.Max(S(20), x + width - titleX - S(20));
+            using (SolidBrush ink = new SolidBrush(_palette.Text))
+                g.DrawString(ClipText(title, _titleFont, titleW), _titleFont, ink,
+                    new PointF(titleX, y + (headerHeight - LineHeight(_titleFont)) / 2f));
+            DrawDownChevron(g, new Rectangle(x + width - S(16), y, S(16), headerHeight), _palette.Muted);
+
+            y += headerHeight;
+            List<string> lines = WrapBody(BubbleBody(), width, 3);
             if (lines.Count > 0)
             {
-                y += S(3);
-                using (SolidBrush ink = new SolidBrush(Color.FromArgb(72, 78, 94)))
+                y += S(5);
+                using (SolidBrush ink = new SolidBrush(_palette.Text))
                 {
-                    for (int i = 0; i < lines.Count; i++)
+                    foreach (string line in lines)
                     {
-                        g.DrawString(lines[i], _bodyFont, ink, new PointF(r.X + padX, y));
+                        g.DrawString(line, _bodyFont, ink, new PointF(x, y));
                         y += LineHeight(_bodyFont);
                     }
                 }
@@ -675,16 +878,48 @@ namespace DshPet
             string footer = BubbleFooter();
             if (footer.Length > 0)
             {
-                y += S(2);
-                StringFormat fmt = new StringFormat();
-                fmt.Alignment = StringAlignment.Far;
-                fmt.FormatFlags = StringFormatFlags.NoWrap;
-                using (SolidBrush ink = new SolidBrush(Color.FromArgb(146, 152, 168)))
+                y += S(5);
+                using (SolidBrush ink = new SolidBrush(_palette.Muted))
+                using (StringFormat format = new StringFormat())
                 {
-                    g.DrawString(ClipText(footer, _smallFont, r.Width - padX * 2), _smallFont, ink,
-                        new RectangleF(r.X + padX, y, r.Width - padX * 2, LineHeight(_smallFont)), fmt);
+                    format.Alignment = StringAlignment.Far;
+                    format.FormatFlags = StringFormatFlags.NoWrap;
+                    g.DrawString(ClipText(footer, _smallFont, width), _smallFont, ink,
+                        new RectangleF(x, y, width, LineHeight(_smallFont)), format);
                 }
-                fmt.Dispose();
+            }
+        }
+
+        void DrawBubbleStatus(Graphics g, Rectangle marker, bool terminal, bool success, bool waiting)
+        {
+            Color color = terminal ? (success ? _palette.Success : _palette.Failure) : waiting ? _palette.Warning : _palette.Accent;
+            Color fill = terminal ? (success ? _palette.SuccessFill : _palette.FailureFill) : waiting ? _palette.WarningFill : _palette.Selected;
+            FillPlate(g, marker, marker.Height / 2, fill);
+            float x = marker.Left + marker.Width / 2f;
+            float y = marker.Top + marker.Height / 2f;
+            using (Pen stroke = IconStroke(color))
+            {
+                if (terminal && success)
+                {
+                    g.DrawLines(stroke, new PointF[] {
+                        new PointF(x - S(4f), y), new PointF(x - S(1f), y + S(3f)), new PointF(x + S(4f), y - S(3f))
+                    });
+                }
+                else if (terminal)
+                {
+                    g.DrawLine(stroke, x - S(3f), y - S(3f), x + S(3f), y + S(3f));
+                    g.DrawLine(stroke, x + S(3f), y - S(3f), x - S(3f), y + S(3f));
+                }
+                else if (waiting)
+                {
+                    g.DrawLine(stroke, x, y - S(3.2f), x, y);
+                    g.DrawLine(stroke, x, y + S(2.8f), x, y + S(3f));
+                }
+                else
+                {
+                    using (SolidBrush dot = new SolidBrush(color))
+                        g.FillEllipse(dot, x - S(2.6f), y - S(2.6f), S(5.2f), S(5.2f));
+                }
             }
         }
 
@@ -755,7 +990,7 @@ namespace DshPet
         }
 
         /// <summary>把合成位图（直通 alpha）预乘后写进 DIB，再整块推送。</summary>
-        void PushLayered()
+        void PushLayered(Point destination)
         {
             if (_compose == null || _dib == IntPtr.Zero) return;
             int w = _compose.Width;
@@ -801,23 +1036,32 @@ namespace DshPet
                 }
             }
 
-            Native.POINT dst = new Native.POINT(Left, Top);
-            Native.SIZE size = new Native.SIZE(w, h);
-            Native.POINT src = new Native.POINT(0, 0);
-            Native.BLENDFUNCTION blend = new Native.BLENDFUNCTION();
-            blend.BlendOp = 0;
-            blend.BlendFlags = 0;
-            blend.SourceConstantAlpha = 255;
-            blend.AlphaFormat = 1;
-            if (!Native.UpdateLayeredWindow(Handle, _screenDc, ref dst, ref size, _memDc, ref src, 0, ref blend, Native.ULW_ALPHA))
-            {
-                int err = Marshal.GetLastWin32Error();
-                if (err != 0) Log.W("UpdateLayeredWindow failed err=" + err);
-            }
+            PresentLayered(destination);
 
             if (_opts.Dump && ++_dumpCounter % 20 == 0)
             {
                 try { _compose.Save(_opts.LogPath + ".dump.png", ImageFormat.Png); } catch { }
+            }
+        }
+
+        void PresentLayered(Point destination)
+        {
+            if (_dib == IntPtr.Zero) return;
+            Native.POINT dst = new Native.POINT(destination.X, destination.Y);
+            Native.SIZE size = new Native.SIZE(_dibW, _dibH);
+            Native.POINT src = new Native.POINT(0, 0);
+            Native.BLENDFUNCTION blend = new Native.BLENDFUNCTION();
+            blend.SourceConstantAlpha = 255;
+            blend.AlphaFormat = 1;
+            // 位置和图像交给同一次分层窗口更新，避免先搬空窗口再补图。
+            if (!Native.UpdateLayeredWindow(Handle, _screenDc, ref dst, ref size, _memDc, ref src, 0, ref blend, Native.ULW_ALPHA))
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error != 0) Log.W("UpdateLayeredWindow failed err=" + error);
+            }
+            else if (Left != destination.X || Top != destination.Y || Width != _dibW || Height != _dibH)
+            {
+                UpdateBounds();
             }
         }
 
@@ -883,16 +1127,16 @@ namespace DshPet
             }
             SetRow(row);
 
+            bool layoutChanged = _lastLayoutHash != LayoutHash();
             double wait = 1000.0 / Math.Max(2, RowFps(_row));
             if ((now - _frameAt).TotalMilliseconds >= wait)
             {
                 _frameAt = now;
                 _frame = (_frame + 1) % Math.Max(1, RowFrames(_row));
-                Render();
+                if (!layoutChanged) Render();
             }
 
-            // 气泡到期后要收起来：定时重排一次，避免"到点了还挂着"
-            if (_lastLayoutHash != LayoutHash()) Relayout(false);
+            if (layoutChanged) Relayout(false);
         }
 
         int _lastLayoutHash = -1;
@@ -903,6 +1147,9 @@ namespace DshPet
             hash = hash * 31 + (BubbleVisible() ? 1 : 0);
             hash = hash * 31 + (FocusHintVisible ? 1 : 0);
             hash = hash * 31 + (HoverVisible ? 1 : 0);
+            hash = hash * 31 + (RestIndicatorVisible ? 1 : 0);
+            hash = hash * 31 + (ReviewedNotice != null ? 1 : 0);
+            hash = hash * 31 + _unreadCount;
             hash = hash * 31 + PetW;
             hash = hash * 31 + PetH;
             hash = hash * 31 + (_state.Title ?? "").GetHashCode();
@@ -921,18 +1168,44 @@ namespace DshPet
             Log.W("released stale capture");
         }
 
+        Point PetFoot()
+        {
+            return new Point(Left + Width / 2, Top + _petBottomOffset);
+        }
+
+        Point DragAnchor(Point cursor)
+        {
+            return new Point(_dragStartAnchor.X + cursor.X - _dragStartScreen.X,
+                _dragStartAnchor.Y + cursor.Y - _dragStartScreen.Y);
+        }
+
+        void MoveDrag(Point cursor)
+        {
+            Point anchor = DragAnchor(cursor);
+            if (HoverVisible && _actionsBelow != ActionsFitBelow(anchor))
+            {
+                Relayout(false);
+                return;
+            }
+            Point destination = LocationForAnchor(anchor, Width, Height);
+            if (destination != Location) PresentLayered(destination);
+        }
+
         void FinishPointerInteraction(bool buttonReleased)
         {
             if (!_dragging) return;
             bool moved = _dragMoved;
+            if (moved && buttonReleased) MoveDrag(Cursor.Position);
             _dragging = false;
             _dragMoved = false;
             if (Native.GetCapture() == Handle) Native.ReleaseCapture();
 
             if (moved)
             {
-                PinAnchorFromWindow();
-                Log.W("drag to " + Location.X + "," + Location.Y);
+                Point anchor = PetFoot();
+                _anchorX = anchor.X;
+                _anchorY = anchor.Y;
+                Log.W("drag to " + anchor.X + "," + anchor.Y);
                 PostPos();
             }
             else if (buttonReleased)
@@ -942,23 +1215,32 @@ namespace DshPet
             Relayout(false);
         }
 
+        PetAction ActionAt(Point local)
+        {
+            if (!_restIndicator.IsEmpty && _restIndicator.Contains(local)) return PetAction.ReviewNotice;
+            if (HoverVisible)
+            {
+                if (_btnCompose.Contains(local)) return PetAction.Compose;
+                if (_btnVoice.Contains(local)) return PetAction.Voice;
+                if (_btnFold.Contains(local)) return PetAction.ToggleBubble;
+            }
+            return _bubbleRect.Contains(local) ? PetAction.FoldBubble : PetAction.None;
+        }
+
         void OnHoverTick()
         {
             if (_closing || !IsHandleCreated) return;
             if (_dragging && !Native.IsPrimaryMouseButtonDown()) FinishPointerInteraction(false);
             ReleaseStaleCapture();
+
             Point cursor = Cursor.Position;
-            bool inside = Bounds.Contains(cursor);
-            int button = 0;
-            if (HoverVisible)
+            Point local = PointToClient(cursor);
+            bool inside = Bounds.Contains(cursor) && (_hover || HitTest(local));
+            PetAction action = !_dragging && inside && HitTest(local) ? ActionAt(local) : PetAction.None;
+            if (action != _hoverAction)
             {
-                Point local = PointToClient(cursor);
-                if (_btnCompose.Contains(local)) button = 1;
-                else if (_btnVoice.Contains(local)) button = 2;
-            }
-            if (button != _hoverButton)
-            {
-                _hoverButton = button;
+                _hoverAction = action;
+                Cursor = action == PetAction.None ? Cursors.Default : Cursors.Hand;
                 Render();
             }
             if (inside)
@@ -973,7 +1255,6 @@ namespace DshPet
             else if (_hover && (DateTime.UtcNow - _hoverLostAt).TotalMilliseconds > 300)
             {
                 _hover = false;
-                _hoverButton = 0;
                 Relayout(false);
             }
         }
@@ -982,6 +1263,15 @@ namespace DshPet
 
         protected override void WndProc(ref Message m)
         {
+            if (OverlayPalette.IsThemeMessage(m.Msg))
+            {
+                OverlayPalette palette = OverlayPalette.Current();
+                if (_palette != palette)
+                {
+                    _palette = palette;
+                    if (Visible) Render();
+                }
+            }
             if (m.Msg == Native.WM_NCHITTEST)
             {
                 // 菜单打开时宠物让出输入。写作窗打开时只有未被覆盖的操作按钮响应。
@@ -992,9 +1282,8 @@ namespace DshPet
                 }
                 Point screen = new Point((short)(m.LParam.ToInt32() & 0xFFFF), (short)((m.LParam.ToInt32() >> 16) & 0xFFFF));
                 Point local = PointToClient(screen);
-                bool acceptsClick = IsComposing
-                    ? !_composeWindow.Bounds.Contains(screen) && (_btnCompose.Contains(local) || _btnVoice.Contains(local))
-                    : HitTest(local);
+                bool acceptsClick = HitTest(local) && (!IsComposing
+                    || (!_composeWindow.Bounds.Contains(screen) && ActionAt(local) != PetAction.None));
                 m.Result = (IntPtr)(acceptsClick ? Native.HTCLIENT : Native.HTTRANSPARENT);
                 return;
             }
@@ -1005,17 +1294,22 @@ namespace DshPet
             }
             if (m.Msg == Native.WM_LBUTTONDOWN)
             {
-                Point p = PointOf(m.LParam);
-                _lastMouse = p;
-                if (HoverVisible && (_btnCompose.Contains(p) || _btnVoice.Contains(p)))
+                Point local = PointOf(m.LParam);
+                switch (ActionAt(local))
                 {
-                    OpenCompose(_btnVoice.Contains(p));
-                    return;
+                    case PetAction.Compose: OpenCompose(false); return;
+                    case PetAction.Voice: OpenCompose(true); return;
+                    case PetAction.ToggleBubble:
+                        if (BubbleVisible()) FoldBubble();
+                        else ExpandBubble();
+                        return;
+                    case PetAction.FoldBubble: FoldBubble(); return;
+                    case PetAction.ReviewNotice: ExpandBubble(); return;
                 }
                 _dragging = true;
                 _dragMoved = false;
                 _dragStartScreen = Cursor.Position;
-                _dragStartWindow = Location;
+                _dragStartAnchor = PetFoot();
                 Log.W("mouse down at " + _dragStartScreen.X + "," + _dragStartScreen.Y);
                 return;
             }
@@ -1032,19 +1326,7 @@ namespace DshPet
                         // 只有真的拖动时才抢鼠标；单击不抢，避免偶发丢 up 后捕获悬挂
                         Native.SetCapture(Handle);
                     }
-                    if (_dragMoved)
-                    {
-                        Location = ClampWindow(new Point(_dragStartWindow.X + dx, _dragStartWindow.Y + dy), Width, Height);
-                        // 残影：窗口先移动，分层表面还停在上一帧，下一次推送要等 80ms 的动画定时器，
-                        // 快速拖动时中间这些帧就是用户看到的拖尾。这里立刻补推一帧
-                        // （内容没变，PushLayered 只做一次全量 DIB 拷贝），并按 8ms 节流。
-                        long nowTick = Environment.TickCount;
-                        if (nowTick - _dragPushAt >= 8)
-                        {
-                            _dragPushAt = nowTick;
-                            PushLayered();
-                        }
-                    }
+                    if (_dragMoved) MoveDrag(now);
                 }
                 return;
             }
@@ -1069,8 +1351,21 @@ namespace DshPet
             if (m.Msg == Native.WM_DPICHANGED)
             {
                 int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
-                if (dpi > 0) _dpi = dpi / 96f;
-                Relayout(true);
+                if (dpi > 0 && _dpi != dpi / 96f)
+                {
+                    _dpi = dpi / 96f;
+                    // UpdateLayeredWindow can deliver this message synchronously on monitor changes.
+                    // Wait until that call returns before replacing its DIB.
+                    if (IsHandleCreated && !_dpiLayoutQueued)
+                    {
+                        _dpiLayoutQueued = true;
+                        BeginInvoke(new Action(delegate
+                        {
+                            _dpiLayoutQueued = false;
+                            if (!_closing) Relayout(true);
+                        }));
+                    }
+                }
                 return;
             }
             if (m.Msg == Native.WM_DISPLAYCHANGE)
@@ -1085,12 +1380,6 @@ namespace DshPet
         {
             int value = lParam.ToInt32();
             return new Point((short)(value & 0xFFFF), (short)((value >> 16) & 0xFFFF));
-        }
-
-        void PinAnchorFromWindow()
-        {
-            _anchorX = Location.X + Width / 2;
-            _anchorY = Location.Y + Height - S(6);
         }
 
         void OnPetClicked()
@@ -1135,12 +1424,14 @@ namespace DshPet
             list.Add(pets);
 
             OverlayMenu.Entry bubble = OverlayMenu.Entry.Submenu("bubble", Localized("气泡显示", "Bubble"));
-            bubble.Children.Add(OverlayMenu.Entry.Check("bubbleMs:3000", Localized("3 秒", "3 s"), _state.BubbleMs == 3000, _state.Bubble));
-            bubble.Children.Add(OverlayMenu.Entry.Check("bubbleMs:5000", Localized("5 秒", "5 s"), _state.BubbleMs == 5000, _state.Bubble));
-            bubble.Children.Add(OverlayMenu.Entry.Check("bubbleMs:8000", Localized("8 秒", "8 s"), _state.BubbleMs == 8000, _state.Bubble));
-            bubble.Children.Add(OverlayMenu.Entry.Check("bubbleMs:0", Localized("一直显示", "Always"), _state.BubbleMs == 0, _state.Bubble));
+            bool automatic = _bubbleDisplay == BubbleDisplay.Automatic;
+            bool timed = automatic && _state.Bubble;
+            bubble.Children.Add(OverlayMenu.Entry.Check("bubbleMs:3000", Localized("3 秒", "3 s"), timed && _state.BubbleMs == 3000, true));
+            bubble.Children.Add(OverlayMenu.Entry.Check("bubbleMs:5000", Localized("5 秒", "5 s"), timed && _state.BubbleMs == 5000, true));
+            bubble.Children.Add(OverlayMenu.Entry.Check("bubbleMs:8000", Localized("8 秒", "8 s"), timed && _state.BubbleMs == 8000, true));
+            bubble.Children.Add(OverlayMenu.Entry.Check("bubbleMs:0", Localized("一直显示", "Always"), timed && _state.BubbleMs == 0, true));
             bubble.Children.Add(OverlayMenu.Entry.Separator());
-            bubble.Children.Add(OverlayMenu.Entry.Check("bubble:off", Localized("关闭气泡", "Hide bubble"), !_state.Bubble, true));
+            bubble.Children.Add(OverlayMenu.Entry.Check("bubble:off", Localized("关闭气泡", "Hide bubble"), automatic && !_state.Bubble, true));
             list.Add(bubble);
 
             OverlayMenu.Entry size = OverlayMenu.Entry.Submenu("size", Localized("大小", "Size"));
@@ -1181,8 +1472,8 @@ namespace DshPet
                 else if (id == "install") InstallPet();
                 else if (id == "opendir") OpenPetsFolder();
                 else if (id == "sound") PostConfig("sound", _state.Sound ? "0" : "1");
-                else if (id.StartsWith("bubbleMs:")) PostConfig("bubbleMs", id.Substring("bubbleMs:".Length));
-                else if (id == "bubble:off") PostConfig("bubble", "0");
+                else if (id.StartsWith("bubbleMs:")) ConfigureAutomaticBubble(id.Substring("bubbleMs:".Length));
+                else if (id == "bubble:off") ConfigureAutomaticBubble(null);
                 else if (id.StartsWith("scale:")) PostConfig("scale", id.Substring("scale:".Length));
                 else if (id.StartsWith("pet:")) PostConfig("pet", id.Substring("pet:".Length));
                 else if (id.StartsWith("test:")) PostTest(id.Substring("test:".Length));
@@ -1190,6 +1481,32 @@ namespace DshPet
             catch (Exception error)
             {
                 Log.W("menu action failed: " + error.Message);
+            }
+        }
+
+        void ApplyVisibility(bool visible)
+        {
+            if (_petHidden == !visible) return;
+            _petHidden = !visible;
+            if (_petHidden)
+            {
+                CloseMenu();
+                FinishPointerInteraction(false);
+                if (IsComposing) _composeWindow.Dismiss();
+                _hover = false;
+                _hoverAction = PetAction.None;
+                Cursor = Cursors.Default;
+                _animTimer.Stop();
+                _hoverTimer.Stop();
+                Hide();
+                Log.W("pet hidden");
+            }
+            else
+            {
+                Show();
+                _animTimer.Start();
+                _hoverTimer.Start();
+                Log.W("pet shown");
             }
         }
 
@@ -1270,23 +1587,42 @@ namespace DshPet
         void OpenCompose(bool voice)
         {
             ReleaseStaleCapture();
-            if (IsComposing)
+            if (_composeWindow != null && !_composeWindow.IsDisposed)
             {
+                if (_composeWindow.Visible && !voice)
+                {
+                    _composeWindow.Dismiss();
+                    return;
+                }
+                if (!_composeWindow.Visible)
+                {
+                    PlaceCompose(_composeWindow);
+                    _composeWindow.Show(this);
+                }
+                if (voice) _composeWindow.ToggleVoice();
                 _composeWindow.Activate();
-                if (voice) _composeWindow.StartVoice();
+                _composeWindow.FocusDraft();
                 return;
             }
 
             ComposeWindow window = new ComposeWindow(
-                new Rectangle(0, 0, S(350), S(224)),
+                new Rectangle(0, 0, S(350), S(ComposeWindow.BaseHeight)),
                 Localized, LoadComposeTargets, SubmitText, voice);
             _composeWindow = window;
             window.SizeChanged += delegate { PlaceCompose(window); };
+            window.RecordingChanged += delegate
+            {
+                if (!_closing && !_petHidden) Render();
+            };
+            window.VisibleChanged += delegate
+            {
+                if (!_closing && !_petHidden) Relayout(false);
+            };
             window.FormClosed += delegate
             {
                 if (_composeWindow != window) return;
                 _composeWindow = null;
-                if (!_closing) Relayout(false);
+                if (!_closing && !_petHidden) Relayout(false);
             };
             PlaceCompose(window);
             window.Show(this);
@@ -1304,8 +1640,8 @@ namespace DshPet
             int above = Math.Min(pet.Top, Top) - window.Height - gap;
             int below = Math.Max(pet.Bottom, Bottom) + gap;
             int x = pet.Left + (pet.Width - window.Width) / 2;
-            int y = above >= area.Top ? above : below;
-            if (y + window.Height > area.Bottom)
+            int y = below + window.Height <= area.Bottom ? below : above;
+            if (y < area.Top || y + window.Height > area.Bottom)
             {
                 int right = pet.Right + gap;
                 int left = pet.Left - gap - window.Width;
@@ -1402,8 +1738,7 @@ namespace DshPet
             form["pos"] = "1";
             form["posx"] = _anchorX.ToString();
             form["posy"] = _anchorY.ToString();
-            _serverPosX = _anchorX;
-            _serverPosY = _anchorY;
+            // Keep the last server-observed position so an older in-flight poll cannot undo this move.
             Post("/config", form);
         }
 
@@ -1582,7 +1917,7 @@ namespace DshPet
             _state.AlertId = "";
             _contentAt = DateTime.UtcNow;
             _contentKey = "disconnected";
-            Relayout(false);
+            if (!_petHidden) Relayout(false);
         }
 
         void ApplyState(PetState state)
@@ -1632,10 +1967,12 @@ namespace DshPet
             }
             if (state.AlertId.Length == 0) _lastAlertId = "";
 
+            ObserveNotifications(state);
             string previousPath = _sheetPath;
             _state = state;
             if (state.PetPath != previousPath) LoadSheet(state.PetPath);
-            Relayout(false);
+            ApplyVisibility(state.Visible);
+            if (!_petHidden) Relayout(false);
 
             if (first)
             {

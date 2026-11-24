@@ -1,8 +1,6 @@
 // dsh-pet · 可复用的分层绘制面
 //
-// 把"32bpp 合成位图 → 预乘 alpha → DIB → UpdateLayeredWindow"这套流程收成一个类，
-// 菜单和宠物窗口都用它。重点是预乘：UpdateLayeredWindow 要求每个颜色分量已乘以
-// alpha，直接塞 GDI+ 的直通 alpha 会出现黑边/白边。
+// 宠物和菜单共用主题。菜单的 32bpp 位图转换为预乘 alpha 后与屏幕坐标一同提交。
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -11,6 +9,83 @@ using System.Windows.Forms;
 
 namespace DshPet
 {
+    sealed class OverlayPalette
+    {
+        public Color Surface { get; private set; }
+        public Color Text { get; private set; }
+        public Color Muted { get; private set; }
+        public Color Line { get; private set; }
+        public Color Hover { get; private set; }
+        public Color Selected { get; private set; }
+        public Color Accent { get; private set; }
+        public Color Marker { get; private set; }
+        public Color MarkerText { get; private set; }
+        public Color Success { get; private set; }
+        public Color SuccessFill { get; private set; }
+        public Color Warning { get; private set; }
+        public Color WarningFill { get; private set; }
+        public Color Failure { get; private set; }
+        public Color FailureFill { get; private set; }
+
+        public static readonly OverlayPalette Light = new OverlayPalette
+        {
+            Surface = Color.FromArgb(250, 249, 251, 255),
+            Text = Color.FromArgb(24, 37, 61),
+            Muted = Color.FromArgb(84, 99, 123),
+            Line = Color.FromArgb(220, 228, 241),
+            Hover = Color.FromArgb(234, 241, 252),
+            Selected = Color.FromArgb(221, 234, 253),
+            Accent = Color.FromArgb(34, 93, 181),
+            Marker = Color.FromArgb(36, 96, 189),
+            MarkerText = Color.White,
+            Success = Color.FromArgb(35, 108, 77),
+            SuccessFill = Color.FromArgb(222, 240, 230),
+            Warning = Color.FromArgb(138, 82, 22),
+            WarningFill = Color.FromArgb(251, 236, 207),
+            Failure = Color.FromArgb(164, 46, 68),
+            FailureFill = Color.FromArgb(251, 228, 234),
+        };
+
+        public static readonly OverlayPalette Dark = new OverlayPalette
+        {
+            Surface = Color.FromArgb(251, 29, 38, 56),
+            Text = Color.FromArgb(237, 243, 252),
+            Muted = Color.FromArgb(174, 187, 208),
+            Line = Color.FromArgb(59, 73, 96),
+            Hover = Color.FromArgb(48, 63, 89),
+            Selected = Color.FromArgb(49, 74, 115),
+            Accent = Color.FromArgb(161, 195, 255),
+            Marker = Color.FromArgb(172, 200, 253),
+            MarkerText = Color.FromArgb(25, 49, 93),
+            Success = Color.FromArgb(159, 223, 188),
+            SuccessFill = Color.FromArgb(39, 66, 61),
+            Warning = Color.FromArgb(240, 199, 126),
+            WarningFill = Color.FromArgb(72, 56, 39),
+            Failure = Color.FromArgb(250, 164, 179),
+            FailureFill = Color.FromArgb(78, 46, 64),
+        };
+
+        public static OverlayPalette Current()
+        {
+            try
+            {
+                object value = Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                    "AppsUseLightTheme", 1);
+                if (value is int && (int)value == 0) return Dark;
+            }
+            catch { }
+            return Light;
+        }
+
+        public static bool IsThemeMessage(int message)
+        {
+            const int SettingChanged = 0x001A;
+            const int ThemeChanged = 0x031A;
+            return message == SettingChanged || message == ThemeChanged;
+        }
+    }
+
     sealed class LayeredSurface : IDisposable
     {
         Bitmap _bitmap;
@@ -49,7 +124,7 @@ namespace DshPet
             _bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
             _graphics = Graphics.FromImage(_bitmap);
             _graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            _graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            _graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
             EnsureDib();
         }
 
@@ -78,9 +153,9 @@ namespace DshPet
             if (_alpha.Length != Width * Height) _alpha = new byte[Width * Height];
         }
 
-        public void Push(Form form)
+        public bool Push(Form form, Point destination)
         {
-            if (_bitmap == null) return;
+            if (_bitmap == null || _dibBits == IntPtr.Zero) return false;
             int w = Width;
             int h = Height;
             BitmapData data = _bitmap.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
@@ -123,7 +198,7 @@ namespace DshPet
                 }
             }
 
-            Native.POINT dst = new Native.POINT(form.Left, form.Top);
+            Native.POINT dst = new Native.POINT(destination.X, destination.Y);
             Native.SIZE size = new Native.SIZE(w, h);
             Native.POINT src = new Native.POINT(0, 0);
             Native.BLENDFUNCTION blend = new Native.BLENDFUNCTION();
@@ -131,7 +206,7 @@ namespace DshPet
             blend.BlendFlags = 0;
             blend.SourceConstantAlpha = 255;
             blend.AlphaFormat = 1;
-            Native.UpdateLayeredWindow(form.Handle, _screenDc, ref dst, ref size, _memDc, ref src, 0, ref blend, Native.ULW_ALPHA);
+            return Native.UpdateLayeredWindow(form.Handle, _screenDc, ref dst, ref size, _memDc, ref src, 0, ref blend, Native.ULW_ALPHA);
         }
 
         public bool HitTest(Point p)

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { serializeState } from '../src/routes.js';
+import { serializeState, VISIBILITY_PATH, visibilityHandler } from '../src/routes.js';
 
 function toMap(text) {
   const map = new Map();
@@ -150,4 +150,46 @@ test('挂载前缀变化后，路由仍能正确解析端点（重载撞车退�
   const wrong = makeRes();
   await api.handler({ method: 'GET', url: '/x-dsh-pet/state', headers: { 'x-pet-token': 't0' } }, wrong);
   assert.equal(wrong.out.status, 404, '旧前缀不应再被这个实例处理');
+});
+
+test('状态协议正常带出显示和隐藏，旧状态默认显示', () => {
+  assert.match(serializeState({ visible: false }), /^visible=0$/m);
+  assert.match(serializeState({ visible: true }), /^visible=1$/m);
+  assert.match(serializeState({}), /^visible=1$/m);
+});
+
+test('回合已切换时仍传递最近的结束通知', () => {
+  const notice = { id: 'root:1:completed', kind: 'completed', title: '任务完成', body: '验证 · 中文' };
+  const state = toMap(serializeState({ status: 'running', notice }));
+  assert.equal(state.get('notice.id'), notice.id);
+  assert.equal(state.get('notice.kind'), notice.kind);
+  assert.equal(state.get('notice.title'), notice.title);
+  assert.equal(state.get('notice.body'), notice.body);
+  assert.equal(state.has('alert.id'), false);
+});
+
+test('Unicode 截断不影响状态解析', () => {
+  const state = toMap(serializeState({ line1: '片段' + String.fromCharCode(0xd83d), sessionId: 'root', waiting: 2 }));
+  assert.equal(state.get('line1'), '片段�');
+  assert.equal(state.get('session.id'), 'root');
+  assert.equal(state.get('waiting'), '2');
+});
+
+test('DSH 可见性接口等待读取原设置，只接受布尔写入', async () => {
+  let visible = false;
+  let release;
+  const ready = new Promise(resolve => { release = resolve; });
+  const calls = [];
+  const service = { store: { get: () => ({ visible }) }, async configure(data) { calls.push(data); visible = data.visible; } };
+  const handler = visibilityHandler({ service, ready });
+  const url = 'http://127.0.0.1' + VISIBILITY_PATH;
+  const get = handler(new Request(url));
+  release();
+  assert.deepEqual(await (await get).json(), { visible: false });
+  const put = (data, type = 'application/json') => handler(new Request(url, { method: 'PUT', headers: { 'Content-Type': type }, body: JSON.stringify(data) }));
+  assert.equal((await put({ visible: 'true' })).status, 400);
+  assert.equal((await put({ visible: true }, 'text/plain')).status, 415);
+  assert.deepEqual(await (await put({ visible: true })).json(), { visible: true });
+  assert.deepEqual(calls, [{ visible: true }]);
+  assert.deepEqual(await (await handler(new Request(url))).json(), { visible: true });
 });

@@ -17,7 +17,7 @@ import { OverlaySupervisor, buildOverlay, writeRuntimeFile } from './overlay.js'
 import { PetModel, excerpt, textOfMessage } from './pet-state.js';
 import { installPet, listPets, powerShellPath } from './pets.js';
 import { startProfiler } from './profiler.js';
-import { PetHttpApi, PREFIX } from './routes.js';
+import { PetHttpApi, PREFIX, VISIBILITY_PATH, visibilityHandler } from './routes.js';
 
 export const name = 'dsh-pet';
 // webServer 就绪后才加载本插件：路由要挂在它的 127.0.0.1 端口上
@@ -117,6 +117,7 @@ class PetService {
         : null,
       pets: this.pets.map((item) => ({ id: item.id, name: item.name })),
       scale: config.scale,
+      visible: config.visible,
       bubble: config.bubble,
       sound: config.sound,
       bubbleMs: config.bubbleMs,
@@ -203,6 +204,7 @@ class PetService {
       }
     }
     const config = this.store.get();
+    if (body.visible !== undefined) patch.visible = asBool(body.visible, config.visible);
     if (body.bubble !== undefined) patch.bubble = asBool(body.bubble, config.bubble);
     if (body.sound !== undefined) patch.sound = asBool(body.sound, config.sound);
     if (body.bubbleMs !== undefined && body.bubbleMs !== '') {
@@ -373,6 +375,19 @@ export function apply(ctx, pluginConfig = {}) {
     service.prefix = prefix;
     log(`已挂载 ${prefix}/* 到 ${safeOrigin(ctx)}`);
 
+    const configReady = mkdir(LOG_DIR, { recursive: true })
+      .then(() => store.load((message) => log(`配置：${message}`)));
+    const offVisibility = ctx.inject(['connection'], (scope) => {
+      const routes = scope.connection.fetch;
+      if (typeof routes?.register !== 'function') return;
+      return routes.register({
+        path: VISIBILITY_PATH,
+        methods: ['GET', 'PUT'],
+        requestBody: 'buffered',
+        fetch: visibilityHandler({ service, ready: configReady }),
+      });
+    });
+
     const offController = ctx.inject(['sessionController'], (scope) => {
       const unbind = service.compose.bind(scope.sessionController);
       log('已接上 sessionController（浮层可以选择会话并发消息）');
@@ -462,7 +477,7 @@ export function apply(ctx, pluginConfig = {}) {
       return scope.commands.register({
         name: 'pet',
         description: '智能伙伴浮层：查看状态 / 切换宠物 / 安装 petdex 宠物',
-        input: { hint: 'status | pets | pet <名称> | scale <40-125> | bubble <秒> | say <内容> | install <petdex 名称或链接> | test | restart' },
+        input: { hint: 'status | show | hide | pets | pet <名称> | scale <40-125> | bubble <秒> | say <内容> | install <petdex 名称或链接> | test | restart' },
         handler: async (invocation) => {
           try {
             const [verb = 'status', ...rest] = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean);
@@ -485,13 +500,17 @@ export function apply(ctx, pluginConfig = {}) {
         const petName = st.pet?.name ?? '未选择';
         return [
           `浮层：${overlay}`,
-          `宠物：${petName}${st.pet ? `（${st.pet.id}）` : ''}`,
+          `宠物：${petName}${st.pet ? `（${st.pet.id}）` : ''} · ${config.visible ? '显示' : '隐藏'}`,
           `气泡：${config.bubble ? '开' : '关'}（${config.bubbleMs === 0 ? '一直显示' : `${Math.round(config.bubbleMs / 1000)} 秒`}）· 提示音：${config.sound ? '开' : '关'}`,
           `缩放：${Math.round(config.scale * 100)}%`,
           `已装宠物：${st.pets.length} 只`,
           st.alert ? `待确认提醒：${st.alert.text}` : '没有待确认的提醒',
           `日志：${HOST_LOG}`,
         ].join('\n');
+      }
+      if (verb === 'show' || verb === 'hide') {
+        await service.configure({ visible: verb === 'show' });
+        return verb === 'show' ? '已设置为显示宠物' : '已设置为隐藏宠物。输入 /pet show 可恢复。';
       }
       if (verb === 'pets') {
         const list = service.state().pets;
@@ -531,7 +550,6 @@ export function apply(ctx, pluginConfig = {}) {
         return await service.say(arg);
       }
       if (verb === 'restart') {
-        // 托盘已经拿掉了，浮层卡死/放弃重启后，这里是唯一能把它叫回来的入口
         const status = await supervisor?.restart();
         return status?.state === 'running' ? `浮层已重启 pid=${status.pid}` : `浮层重启失败：${status?.error || status?.state}`;
       }
@@ -540,14 +558,16 @@ export function apply(ctx, pluginConfig = {}) {
         await service.configure({ sound: on ? '1' : '0' });
         return `提示音已${on ? '开启' : '关闭'}`;
       }
-      throw new Error(`未知子命令 ${verb}，可用：status / pets / pet / scale / bubble / say / install / test / sound / restart`);
+      throw new Error(`未知子命令 ${verb}，可用：status / show / hide / pets / pet / scale / bubble / say / install / test / sound / restart`);
     };
 
     let supervisor = null;
+    const lifetime = new AbortController();
+    const signal = lifetime.signal;
     const boot = async () => {
       try {
-        await mkdir(LOG_DIR, { recursive: true });
-        await store.load((message) => log(`配置：${message}`));
+        await configReady;
+        signal.throwIfAborted();
         model.setLang?.(store.get().lang);
         const config = store.get();
         if (config.pet) model.setLang?.(config.lang);
@@ -556,6 +576,7 @@ export function apply(ctx, pluginConfig = {}) {
         const exePath = join(PETS_ROOT, 'bin', 'PetOverlay.exe');
 
         await service.refreshPets().catch(() => {});
+        signal.throwIfAborted();
         if (service.pets.length === 0) {
           // 空目录：后台装一只默认宠物，不阻塞浮层启动
           service
@@ -563,7 +584,8 @@ export function apply(ctx, pluginConfig = {}) {
             .then((message) => log(`默认宠物：${message}`))
             .catch(() => {});
         }
-        const build = await buildOverlay({ nativeDir, exePath, log });
+        const build = await buildOverlay({ nativeDir, exePath, log, signal });
+        signal.throwIfAborted();
         if (!build.ok) log(`浮层不可用：${build.message}`);
 
         supervisor = new OverlaySupervisor({
@@ -588,12 +610,14 @@ export function apply(ctx, pluginConfig = {}) {
           startedAt: new Date().toISOString(),
         }).catch(() => {});
 
+        signal.throwIfAborted();
         if (build.ok) await supervisor.start();
       } catch (error) {
-        log(`启动失败：${error?.message ?? error}`);
+        if (!signal.aborted) log(`启动失败：${error?.message ?? error}`);
       }
     };
     boot().then(async () => {
+      if (signal.aborted) return;
       // 启动后跑一次 /pet status，证明不依赖浮层的自检入口真的可用
       try {
         const first = String(await runPetCommand('status', '')).split('\n')[0];
@@ -604,10 +628,10 @@ export function apply(ctx, pluginConfig = {}) {
     });
 
     return async () => {
+      lifetime.abort();
       service.compose.dispose();
       clearInterval(tick);
       clearInterval(lagTimer);
-      await service.profiler?.stop();
       // 单个 disposer 失败不能连坐：之前 offCommand 抛出过 TypeError，
       // 结果 unregister 被跳过，路由永久留在 webserver 上，重载就撞 duplicate。
       const dispose = (fn, label) => {
@@ -625,9 +649,11 @@ export function apply(ctx, pluginConfig = {}) {
       dispose(offQuestions, 'user-questions/request');
       dispose(offCommand, '/pet 命令');
       dispose(offController, 'sessionController');
-      try {
-        await supervisor?.stop();
-      } catch {}
+      await Promise.allSettled([
+        typeof offVisibility === 'function' ? Promise.resolve().then(offVisibility) : undefined,
+        supervisor?.stop(),
+        service.profiler?.stop(),
+      ]);
       log('dsh-pet 已卸载');
     };
   });

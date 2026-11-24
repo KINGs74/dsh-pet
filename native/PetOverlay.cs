@@ -157,10 +157,16 @@ namespace DshPet
         public string Line1 = "";
         public string Line2 = "";
         public int Elapsed = 0;
+        public int Waiting = 0;
+        public string SessionId = "";
         public string AlertId = "";
         public string AlertKind = "";
         public string AlertText = "";
         public int AlertAge = 0;
+        public string NoticeId = "";
+        public string NoticeKind = "";
+        public string NoticeTitle = "";
+        public string NoticeBody = "";
         public string PetId = "";
         public string PetName = "";
         public string PetPath = "";
@@ -169,6 +175,7 @@ namespace DshPet
         public int Cols = 8;
         public int Rows = 9;
         public double Scale = 0.55;
+        public bool Visible = true;
         public bool Bubble = true;
         public bool Sound = true;
         public string Lang = "zh";
@@ -206,10 +213,16 @@ namespace DshPet
                     case "line1": s.Line1 = value; break;
                     case "line2": s.Line2 = value; break;
                     case "elapsed": s.Elapsed = ToInt(value); break;
+                    case "waiting": s.Waiting = ToInt(value); break;
+                    case "session.id": s.SessionId = value; break;
                     case "alert.id": s.AlertId = value; break;
                     case "alert.kind": s.AlertKind = value; break;
                     case "alert.text": s.AlertText = value; break;
                     case "alert.age": s.AlertAge = ToInt(value); break;
+                    case "notice.id": s.NoticeId = value; break;
+                    case "notice.kind": s.NoticeKind = value; break;
+                    case "notice.title": s.NoticeTitle = value; break;
+                    case "notice.body": s.NoticeBody = value; break;
                     case "pet.id": s.PetId = value; break;
                     case "pet.name": s.PetName = value; break;
                     case "pet.path": s.PetPath = value; break;
@@ -218,6 +231,7 @@ namespace DshPet
                     case "frame.cols": s.Cols = Math.Max(1, ToInt(value)); break;
                     case "frame.rows": s.Rows = Math.Max(1, ToInt(value)); break;
                     case "scale": s.Scale = ToDouble(value, 0.55); break;
+                    case "visible": s.Visible = value != "0"; break;
                     case "bubble": s.Bubble = value == "1"; break;
                     case "sound": s.Sound = value == "1"; break;
                     case "lang": s.Lang = value; break;
@@ -280,7 +294,7 @@ namespace DshPet
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Log.W("overlay start version=0.3.3 host=" + opts.Host + " prefix=" + opts.Prefix + " dshPid=" + opts.DshPid);
+            Log.W("overlay start version=0.3.6 host=" + opts.Host + " prefix=" + opts.Prefix + " dshPid=" + opts.DshPid);
             Application.Run(new PetForm(opts));
             Log.W("overlay exit");
             GC.KeepAlive(mutex);

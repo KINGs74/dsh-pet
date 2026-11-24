@@ -60,7 +60,7 @@ export function serializeState(snapshot) {
   const lines = [];
   const put = (key, value) => {
     if (value === undefined || value === null || value === '') return;
-    lines.push(`${key}=${encodeURIComponent(String(value))}`);
+    lines.push(`${key}=${encodeURIComponent(String(value).toWellFormed())}`);
   };
 
   put('status', snapshot.status);
@@ -69,11 +69,18 @@ export function serializeState(snapshot) {
   put('line2', snapshot.line2);
   put('elapsed', snapshot.elapsed);
   put('waiting', snapshot.waiting);
+  put('session.id', snapshot.sessionId);
   if (snapshot.alert) {
     put('alert.id', snapshot.alert.id);
     put('alert.kind', snapshot.alert.kind);
     put('alert.text', snapshot.alert.text);
     put('alert.age', snapshot.alertAge);
+  }
+  if (snapshot.notice) {
+    put('notice.id', snapshot.notice.id);
+    put('notice.kind', snapshot.notice.kind);
+    put('notice.title', snapshot.notice.title);
+    put('notice.body', snapshot.notice.body);
   }
   put('pet.id', snapshot.pet?.id);
   put('pet.name', snapshot.pet?.name);
@@ -83,6 +90,7 @@ export function serializeState(snapshot) {
   put('frame.cols', snapshot.pet?.grid?.cols);
   put('frame.rows', snapshot.pet?.grid?.rows);
   put('scale', snapshot.scale);
+  put('visible', snapshot.visible === false ? '0' : '1');
   put('bubble', snapshot.bubble ? '1' : '0');
   put('sound', snapshot.sound ? '1' : '0');
   put('bubbleMs', snapshot.bubbleMs);
@@ -230,3 +238,26 @@ export class PetHttpApi {
 }
 
 export { PREFIX };
+// Mounted through DSH's owner-only client connection, separate from the overlay HTTP routes.
+export const VISIBILITY_PATH = '/api/dsh-pet/visibility';
+
+export function visibilityHandler({ service, ready }) {
+  return async (request) => {
+    try {
+      await ready;
+      if (request.method === 'PUT') {
+        if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') {
+          return new Response(null, { status: 415 });
+        }
+        const body = await request.json().catch(() => null);
+        if (typeof body?.visible !== 'boolean') return new Response(null, { status: 400 });
+        await service.configure({ visible: body.visible });
+      } else if (request.method !== 'GET') {
+        return new Response(null, { status: 405 });
+      }
+      return Response.json({ visible: service.store.get().visible }, { headers: { 'Cache-Control': 'no-store' } });
+    } catch {
+      return new Response(null, { status: 503 });
+    }
+  };
+}

@@ -188,3 +188,20 @@ test('浮层接口保持鉴权和行协议，转发所选目标与请求 ID', as
   assert.equal(failed.status, 503);
   assert.equal(failed.body, 'session list unavailable');
 });
+
+test('本地 WinForms 两种 GUID 格式映射到同一个投递编号', async () => {
+  const { compose } = fixture();
+  const seen = [];
+  compose.bind({
+    list: async () => ({ items: [item('first')] }),
+    prompt: async ({ requestId }) => {
+      seen.push(requestId);
+      return { accepted: true };
+    },
+  });
+  for (const id of [requestId.replaceAll('-', '').toUpperCase(), requestId]) {
+    const result = await compose.submit({ text: '桌面草稿', targetId: 'first', requestId: id });
+    assert.equal(result.status, 'sent');
+  }
+  assert.deepEqual(seen, [requestId, requestId]);
+});

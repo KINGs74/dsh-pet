@@ -1,5 +1,10 @@
 // The desktop frontend owns the selected chat. The host can enumerate eligible chats.
-const REQUEST_ID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const REQUEST_ID = /^(?:[0-9a-f]{32}|[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i;
+
+function canonicalRequestId(id) {
+  const hex = id.replaceAll('-', '').toLowerCase();
+  return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+}
 const MAX_DRAFT_LENGTH = 6000;
 
 function eligible(item) {
@@ -99,7 +104,7 @@ export class OverlayCompose {
       return reply('failed', '草稿过长，请缩短后重试', 'Shorten the draft and try again.');
     }
     if (typeof targetId !== 'string' || !targetId || typeof requestId !== 'string' || !REQUEST_ID.test(requestId)) {
-      return reply('failed', '请重新打开输入框并选择会话', 'Reopen the composer and select a session.');
+      return reply('failed', '发送目标或请求编号无效，请重新选择会话。', 'The target or request ID is invalid. Select a session again.');
     }
 
     const binding = this.#binding;
@@ -122,7 +127,7 @@ export class OverlayCompose {
     const signal = AbortSignal.any([binding.lifetime.signal, AbortSignal.timeout(this.submitTimeout)]);
     try {
       const result = await within(signal, (signal) => binding.controller.prompt({
-        requestId,
+        requestId: canonicalRequestId(requestId),
         sessionId: targetId,
         mode: 'queue',
         content: [{ type: 'text', text }],
