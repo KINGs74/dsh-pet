@@ -205,3 +205,22 @@ test('本地 WinForms 两种 GUID 格式映射到同一个投递编号', async (
   }
   assert.deepEqual(seen, [requestId, requestId]);
 });
+
+test('桌面草稿发送到新会话，重试沿用同一新会话', async () => {
+  const { compose } = fixture();
+  const received = [];
+  let created = 0;
+  compose.bind({
+    list: async () => ({ items: [item('existing')] }),
+    create: async () => ({ sessionId: 'new-' + ++created }),
+    prompt: async (request) => {
+      received.push(request.sessionId);
+      return { accepted: received.length > 1 };
+    },
+  });
+  const draft = { targetId: '@new', requestId, text: 'draft' };
+  assert.equal((await compose.submit(draft)).status, 'unknown');
+  assert.equal((await compose.submit(draft)).status, 'sent');
+  assert.equal((await compose.submit({ ...draft, requestId: '217823a4-1134-4c83-981c-53b9468884bc' })).status, 'sent');
+  assert.deepEqual(received, ['new-1', 'new-1', 'new-2']);
+});

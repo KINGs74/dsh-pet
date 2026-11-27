@@ -127,7 +127,6 @@ namespace DshPet
         Font _titleFont;
         Font _bodyFont;
         Font _smallFont;
-        Font _iconFont;
         float _fontScale;
         readonly Graphics _measure;
         OverlayPalette _palette = OverlayPalette.Current();
@@ -220,7 +219,6 @@ namespace DshPet
             _titleFont = new Font("Microsoft YaHei UI", 13f * _dpi, FontStyle.Bold, GraphicsUnit.Pixel);
             _bodyFont = new Font("Microsoft YaHei UI", 12f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel);
             _smallFont = new Font("Microsoft YaHei UI", 11f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel);
-            _iconFont = new Font("Segoe MDL2 Assets", 14.5f * _dpi, FontStyle.Regular, GraphicsUnit.Pixel);
             _fontScale = _dpi;
         }
 
@@ -230,7 +228,6 @@ namespace DshPet
             _titleFont.Dispose();
             _bodyFont.Dispose();
             _smallFont.Dispose();
-            _iconFont.Dispose();
             _titleFont = null;
         }
 
@@ -250,8 +247,10 @@ namespace DshPet
 
         bool HoverVisible
         {
-            get { return _hover || IsComposing; }
+            get { return _hover || IsComposing || IsRecording; }
         }
+
+        bool IsRecording { get { return _composeWindow != null && !_composeWindow.IsDisposed && _composeWindow.Recording; } }
 
         bool IsComposing
         {
@@ -706,24 +705,37 @@ namespace DshPet
             }
 
             bool expanded = BubbleVisible();
-            bool recording = IsComposing && _composeWindow.Recording;
+            bool recording = IsRecording;
             Color writeInk = DrawActionSegment(g, _btnCompose, PetAction.Compose, IsComposing);
             Color voiceInk = DrawActionSegment(g, _btnVoice, PetAction.Voice, recording);
             Color foldInk = DrawActionSegment(g, _btnFold, PetAction.ToggleBubble, expanded);
-            DrawIconGlyph(g, _btnCompose, "\uE70F", writeInk);
+            DrawWriteGlyph(g, _btnCompose, writeInk);
             if (recording)
             {
                 int size = S(10);
-                Rectangle stop = new Rectangle(_btnVoice.Left + (_btnVoice.Width - size) / 2,
-                    _btnVoice.Top + (_btnVoice.Height - size) / 2, size, size);
-                FillPlate(g, stop, S(2), _palette.Failure);
+                using (SolidBrush ink = new SolidBrush(_palette.Failure))
+                    g.FillEllipse(ink, _btnVoice.Left + (_btnVoice.Width - size) / 2f,
+                        _btnVoice.Top + (_btnVoice.Height - size) / 2f, size, size);
             }
-            else DrawIconGlyph(g, _btnVoice, "\uE720", voiceInk);
+            else
+            {
+                using (Pen wave = new Pen(voiceInk, S(1.2f)))
+                {
+                    wave.StartCap = wave.EndCap = LineCap.Round;
+                    float x = _btnVoice.Left + _btnVoice.Width / 2f;
+                    float y = _btnVoice.Top + _btnVoice.Height / 2f;
+                    for (int i = -2; i <= 2; i++)
+                    {
+                        float height = S(4f - Math.Abs(i) * 1.25f);
+                        g.DrawLine(wave, x + S(i * 2.6f), y - height, x + S(i * 2.6f), y + height);
+                    }
+                }
+            }
 
             Rectangle messageIcon = _btnFold;
             if (_unreadCount > 0) messageIcon.Offset(-S(4), S(2));
-            if (expanded) DrawDownChevron(g, messageIcon, foldInk);
-            else DrawBubbleGlyph(g, messageIcon, foldInk);
+            if (expanded) DrawDownChevron(g, messageIcon, foldInk, true);
+            else DrawBellGlyph(g, messageIcon, foldInk);
             if (_unreadCount > 0)
             {
                 int width = _unreadCount > 99 ? S(23) : _unreadCount >= 10 ? S(19) : S(15);
@@ -754,7 +766,7 @@ namespace DshPet
             }
             bool hot = _hoverAction == PetAction.ReviewNotice;
             FillPlate(g, plate, plate.Height / 2, hot ? _palette.Selected : _palette.Surface);
-            DrawBubbleGlyph(g, plate, _palette.Accent);
+            DrawBellGlyph(g, plate, _palette.Accent);
         }
 
         void DrawNoticeCount(Graphics g, Rectangle bounds)
@@ -787,42 +799,54 @@ namespace DshPet
             return stroke;
         }
 
-        void DrawDownChevron(Graphics g, Rectangle bounds, Color color)
+        void DrawDownChevron(Graphics g, Rectangle bounds, Color color, bool up = false)
         {
             float x = bounds.Left + bounds.Width / 2f;
             float y = bounds.Top + bounds.Height / 2f;
             using (Pen stroke = IconStroke(color))
                 g.DrawLines(stroke, new PointF[] {
-                    new PointF(x - S(4.5f), y - S(2f)), new PointF(x, y + S(2.5f)), new PointF(x + S(4.5f), y - S(2f))
+                    new PointF(x - S(4.5f), y + S(up ? 2f : -2f)), new PointF(x, y + S(up ? -2.5f : 2.5f)), new PointF(x + S(4.5f), y + S(up ? 2f : -2f))
                 });
         }
 
-        void DrawBubbleGlyph(Graphics g, Rectangle bounds, Color color)
+        void DrawBellGlyph(Graphics g, Rectangle bounds, Color color)
         {
             float x = bounds.Left + bounds.Width / 2f;
             float y = bounds.Top + bounds.Height / 2f;
             using (Pen stroke = IconStroke(color))
             using (GraphicsPath body = new GraphicsPath())
             {
-                body.AddPolygon(new PointF[] {
-                    new PointF(x - S(6f), y - S(5f)), new PointF(x + S(6f), y - S(5f)),
-                    new PointF(x + S(6f), y + S(3f)), new PointF(x - S(1f), y + S(3f)),
-                    new PointF(x - S(4f), y + S(6f)), new PointF(x - S(4f), y + S(3f)),
-                    new PointF(x - S(6f), y + S(3f))
+                body.AddBezier(x - S(4f), y, x - S(4f), y - S(7f), x + S(4f), y - S(7f), x + S(4f), y);
+                body.AddLines(new PointF[] {
+                    new PointF(x + S(4f), y), new PointF(x + S(6f), y + S(3f)),
+                    new PointF(x - S(6f), y + S(3f)), new PointF(x - S(4f), y)
                 });
+                body.CloseFigure();
                 g.DrawPath(stroke, body);
+                g.DrawArc(stroke, x - S(2f), y + S(3f), S(4f), S(4f), 20, 140);
             }
         }
 
-        void DrawIconGlyph(Graphics g, Rectangle bounds, string glyph, Color color)
+        void DrawWriteGlyph(Graphics g, Rectangle bounds, Color color)
         {
-            using (StringFormat format = new StringFormat())
-            using (SolidBrush ink = new SolidBrush(color))
+            float x = bounds.Left + bounds.Width / 2f;
+            float y = bounds.Top + bounds.Height / 2f;
+            using (Pen stroke = IconStroke(color))
+            using (GraphicsPath frame = new GraphicsPath())
             {
-                format.Alignment = StringAlignment.Center;
-                format.LineAlignment = StringAlignment.Center;
-                format.FormatFlags = StringFormatFlags.NoWrap;
-                g.DrawString(glyph, _iconFont, ink, bounds, format);
+                frame.AddLine(x, y - S(5f), x - S(4f), y - S(5f));
+                frame.AddBezier(x - S(4f), y - S(5f), x - S(5f), y - S(5f), x - S(6f), y - S(5f), x - S(6f), y - S(3f));
+                frame.AddLine(x - S(6f), y - S(3f), x - S(6f), y + S(3f));
+                frame.AddBezier(x - S(6f), y + S(3f), x - S(6f), y + S(5f), x - S(5f), y + S(5f), x - S(4f), y + S(5f));
+                frame.AddLine(x - S(4f), y + S(5f), x + S(3f), y + S(5f));
+                frame.AddBezier(x + S(3f), y + S(5f), x + S(5f), y + S(5f), x + S(5f), y + S(4f), x + S(5f), y + S(3f));
+                frame.AddLine(x + S(5f), y + S(3f), x + S(5f), y + S(1f));
+                g.DrawPath(stroke, frame);
+                g.DrawPolygon(stroke, new PointF[] {
+                    new PointF(x - S(2f), y + S(1f)), new PointF(x - S(1f), y - S(2f)),
+                    new PointF(x + S(4f), y - S(7f)), new PointF(x + S(6f), y - S(5f)),
+                    new PointF(x + S(1f), y)
+                });
             }
         }
 
@@ -1419,7 +1443,7 @@ namespace DshPet
             }
             if (pets.Children.Count == 0) pets.Children.Add(OverlayMenu.Entry.Item("pets:none", Localized("还没有宠物", "No pets yet"), false));
             pets.Children.Add(OverlayMenu.Entry.Separator());
-            pets.Children.Add(OverlayMenu.Entry.Item("install", Localized("安装 petdex 宠物…", "Install a petdex pet…"), true));
+            pets.Children.Add(OverlayMenu.Entry.Item("install", _installingPet ? Localized("正在安装宠物…", "Installing pet…") : Localized("安装 petdex 宠物…", "Install a petdex pet…"), !_installingPet));
             pets.Children.Add(OverlayMenu.Entry.Item("opendir", Localized("打开宠物目录", "Open pets folder"), true));
             list.Add(pets);
 
@@ -1445,15 +1469,6 @@ namespace DshPet
             list.Add(size);
 
             list.Add(OverlayMenu.Entry.Check("sound", Localized("结束提示音", "Finish sound"), _state.Sound, true));
-            list.Add(OverlayMenu.Entry.Item("copy", Localized("复制最近一条", "Copy latest line"), (_state.Line1 ?? "").Length > 0));
-            list.Add(OverlayMenu.Entry.Separator());
-
-            OverlayMenu.Entry rehearse = OverlayMenu.Entry.Submenu("test", Localized("测试提醒", "Rehearse alert"));
-            rehearse.Children.Add(OverlayMenu.Entry.Item("test:completed", Localized("成功演练（绿色 ✔）", "Success (✔)"), true));
-            rehearse.Children.Add(OverlayMenu.Entry.Item("test:failed", Localized("失败演练（红色 ✕）", "Failure (✕)"), true));
-            list.Add(rehearse);
-
-            list.Add(OverlayMenu.Entry.Item("quit", Localized("退出宠物窗", "Quit overlay"), true));
             return list;
         }
 
@@ -1467,8 +1482,6 @@ namespace DshPet
                     CloseMenu();
                     BeginInvoke(new Action(delegate { FocusDsh("menu"); }));
                 }
-                else if (id == "copy") CopyLastLine();
-                else if (id == "quit") Close();
                 else if (id == "install") InstallPet();
                 else if (id == "opendir") OpenPetsFolder();
                 else if (id == "sound") PostConfig("sound", _state.Sound ? "0" : "1");
@@ -1476,7 +1489,6 @@ namespace DshPet
                 else if (id == "bubble:off") ConfigureAutomaticBubble(null);
                 else if (id.StartsWith("scale:")) PostConfig("scale", id.Substring("scale:".Length));
                 else if (id.StartsWith("pet:")) PostConfig("pet", id.Substring("pet:".Length));
-                else if (id.StartsWith("test:")) PostTest(id.Substring("test:".Length));
             }
             catch (Exception error)
             {
@@ -1492,6 +1504,7 @@ namespace DshPet
             {
                 CloseMenu();
                 FinishPointerInteraction(false);
+                if (IsRecording) _composeWindow.CancelRecording();
                 if (IsComposing) _composeWindow.Dismiss();
                 _hover = false;
                 _hoverAction = PetAction.None;
@@ -1520,26 +1533,6 @@ namespace DshPet
         }
 
         /// <summary>把当前气泡正文放进剪贴板：分层窗口里的文字选不中，这是唯一的复制口子。</summary>
-        void CopyLastLine()
-        {
-            try
-            {
-                string text = _state.Line1 ?? "";
-                if (text.Length == 0) text = _state.Title ?? "";
-                if (text.Length == 0)
-                {
-                    Log.W("copy skipped: nothing to copy");
-                    return;
-                }
-                Clipboard.SetText(text);
-                Log.W("copied bubble text " + text.Length + " chars");
-            }
-            catch (Exception error)
-            {
-                Log.W("copy failed: " + error.Message);
-            }
-        }
-
         void OpenPetsFolder()
         {
             try
@@ -1554,33 +1547,45 @@ namespace DshPet
             }
         }
 
-        void InstallPet()
+        bool _installingPet;
+
+        async void InstallPet()
         {
-            InputDialog dialog = new InputDialog(
+            if (_installingPet) return;
+            string source;
+            using (InputDialog dialog = new InputDialog(
                 Localized("安装 petdex 宠物", "Install petdex pet"),
-                Localized("输入 petdex 名称、petdex.dev 链接，或宠物 zip / 文件夹路径：", "petdex name, petdex.dev link, or a local zip / folder:"));
-            if (dialog.ShowDialog(this) != DialogResult.OK) return;
-            string source = dialog.Value.Trim();
+                Localized("输入宠物名称、链接、petdex 安装命令，或本地 zip / 文件夹路径：",
+                    "Enter a pet name, URL, petdex install command, or local zip / folder:")))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                source = dialog.Value.Trim();
+            }
             if (source.Length == 0) return;
+            _installingPet = true;
             System.Windows.Forms.Cursor previous = this.Cursor;
             this.Cursor = Cursors.WaitCursor;
             try
             {
                 Dictionary<string, string> form = new Dictionary<string, string>();
                 form["source"] = source;
-                string text = Http.PostForm(_opts.Host + _opts.Prefix + "/install", _opts.Token, form, 900000);
+                string text = await Task.Run(() => Http.PostForm(_opts.Host + _opts.Prefix + "/install", _opts.Token, form, 900000));
+                if (_closing || IsDisposed) return;
                 Log.W("install result: " + text.Replace("\n", " "));
-                MessageBox.Show(this, text, Localized("安装结果", "Install result"),
-                    MessageBoxButtons.OK, text.StartsWith("已安装") ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                if (!text.StartsWith("已安装", StringComparison.Ordinal))
+                    MessageBox.Show(this, text, Localized("安装结果", "Install result"),
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             catch (Exception error)
             {
                 Log.W("install failed: " + error.Message);
+                if (_closing || IsDisposed) return;
                 MessageBox.Show(this, error.Message, Localized("安装失败", "Install failed"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             finally
             {
-                this.Cursor = previous;
+                _installingPet = false;
+                if (!_closing && !IsDisposed) this.Cursor = previous;
             }
         }
 
@@ -1589,30 +1594,32 @@ namespace DshPet
             ReleaseStaleCapture();
             if (_composeWindow != null && !_composeWindow.IsDisposed)
             {
-                if (_composeWindow.Visible && !voice)
+                if (voice)
+                {
+                    _composeWindow.Hide();
+                    _composeWindow.ToggleVoice();
+                }
+                else if (_composeWindow.Visible)
                 {
                     _composeWindow.Dismiss();
-                    return;
                 }
-                if (!_composeWindow.Visible)
+                else
                 {
                     PlaceCompose(_composeWindow);
                     _composeWindow.Show(this);
+                    _composeWindow.FocusDraft();
                 }
-                if (voice) _composeWindow.ToggleVoice();
-                _composeWindow.Activate();
-                _composeWindow.FocusDraft();
                 return;
             }
 
             ComposeWindow window = new ComposeWindow(
                 new Rectangle(0, 0, S(350), S(ComposeWindow.BaseHeight)),
-                Localized, LoadComposeTargets, SubmitText, voice);
+                Localized, SubmitText);
             _composeWindow = window;
             window.SizeChanged += delegate { PlaceCompose(window); };
             window.RecordingChanged += delegate
             {
-                if (!_closing && !_petHidden) Render();
+                if (!_closing && !_petHidden) Relayout(false);
             };
             window.VisibleChanged += delegate
             {
@@ -1624,6 +1631,11 @@ namespace DshPet
                 _composeWindow = null;
                 if (!_closing && !_petHidden) Relayout(false);
             };
+            if (voice)
+            {
+                window.ToggleVoice();
+                return;
+            }
             PlaceCompose(window);
             window.Show(this);
             Relayout(false);
@@ -1756,13 +1768,6 @@ namespace DshPet
             Post("/ack", form);
             _alertAt = DateTime.UtcNow.AddMilliseconds(-(_state.AlertMs > 0 ? _state.AlertMs : 30000));
             Relayout(false);
-        }
-
-        void PostTest(string kind)
-        {
-            Dictionary<string, string> form = new Dictionary<string, string>();
-            form["kind"] = kind;
-            Post("/test", form);
         }
 
         void Post(string endpoint, Dictionary<string, string> form)
@@ -1984,12 +1989,12 @@ namespace DshPet
         void LoadSheet(string path)
         {
             _sheetPath = path ?? "";
-            if (_sheet != null)
+            if (string.IsNullOrEmpty(path))
             {
-                _sheet.Dispose();
+                if (_sheet != null) _sheet.Dispose();
                 _sheet = null;
+                return;
             }
-            if (string.IsNullOrEmpty(path)) return;
             try
             {
                 if (!File.Exists(path))
@@ -1999,7 +2004,13 @@ namespace DshPet
                 }
                 using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 {
-                    _sheet = Image.FromStream(stream, true, false);
+                    using (Image decoded = Image.FromStream(stream, true, true))
+                    {
+                        Bitmap next = new Bitmap(decoded);
+                        Image previous = _sheet;
+                        _sheet = next;
+                        if (previous != null) previous.Dispose();
+                    }
                 }
                 Log.W("sprite loaded " + _sheet.Width + "x" + _sheet.Height + " " + path);
             }

@@ -1,10 +1,7 @@
 // dsh-pet · 宠物安装 / 校验 / 目录列举
 //
 // petdex 的宠物包就是两件东西：`pet.json` + 一张雪碧图（webp 或 png）。
-// petdex.dev 没有公开 JSON API（/api/* 在 robots 之外且需要鉴权），但它为每个
-// 宠物提供一段安装脚本：GET https://petdex.dev/install/<slug> 返回 shell 脚本，
-// 里面是两条 `curl -o "$PET_DIR/<name>" '<url>'`。我们解析这两条命令拿到
-// 官方素材地址，再用同样的 Referer 下载 —— 与 Codex 侧完全一致的取包路径。
+// 使用 Petdex Desktop 的官方 JSON 下载接口。
 import { createWriteStream } from 'node:fs';
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
@@ -54,11 +51,14 @@ export function sanitizeId(value) {
 export function petdexSlugFromSource(source) {
   const raw = String(source ?? '').trim();
   if (!raw) return '';
+  const command = /^npx\s+petdex(?:@latest)?\s+install\s+([a-zA-Z0-9][a-zA-Z0-9._-]*)$/i.exec(raw);
+  if (command) return command[1].toLowerCase();
   if (/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(raw)) return raw.toLowerCase();
   try {
     const url = new URL(raw);
     if (!/(^|\.)petdex\.dev$/.test(url.hostname)) return '';
     const parts = url.pathname.split('/').filter(Boolean);
+    if (/^[a-z]{2}(?:-[a-z]{2})?$/i.test(parts[0] ?? '')) parts.shift();
     // 支持 https://petdex.dev/pets/<slug>、/pets/<owner>/<slug>、/install/<slug>
     if (parts.length >= 2 && (parts[0] === 'pets' || parts[0] === 'install' || parts[0] === 'pet')) {
       return sanitizeId(parts[parts.length - 1]);
@@ -138,9 +138,10 @@ function run(cmd, args, { timeoutMs = 120_000 } = {}) {
   });
 }
 
-async function download(url, dest, { log = () => {}, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+async function download(url, dest, { log = () => {}, timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch } = {}) {
   log(`下载 ${url}`);
-  const response = await fetch(url, {
+  const response = await fetchImpl(url, {
+    redirect: 'error',
     headers: {
       referer: PETDEX_REFERER,
       'user-agent': 'dsh-pet/0.1 (+https://petdex.dev)',
@@ -246,9 +247,24 @@ export async function finalizePetDir({
   }
 
   const targetDir = join(root, id);
-  await rm(targetDir, { recursive: true, force: true });
-  await mkdir(root, { recursive: true });
-  await rename(stagingDir, targetDir);
+  const previousDir = stagingDir + '-previous';
+  let backedUp = false;
+  try {
+    await rename(targetDir, previousDir);
+    backedUp = true;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  try {
+    await rename(stagingDir, targetDir);
+  } catch (error) {
+    if (backedUp) await rename(previousDir, targetDir);
+    throw error;
+  }
+  if (backedUp) {
+    await rm(previousDir, { recursive: true, force: true }).catch(error =>
+      log('旧宠物文件清理失败：' + error.message));
+  }
 
   return {
     id,
@@ -308,19 +324,28 @@ export async function installPet(source, options = {}) {
   try {
     const slug = petdexSlugFromSource(raw);
     if (slug) {
-      const script = await fetchImpl(`${PETDEX_ORIGIN}/install/${encodeURIComponent(slug)}`, {
-        headers: { referer: PETDEX_REFERER, 'user-agent': 'dsh-pet/0.1' },
+      const response = await fetchImpl(`${PETDEX_ORIGIN}/api/install-pet/${encodeURIComponent(slug)}`, {
+        headers: { accept: 'application/json' },
         signal: AbortSignal.timeout(30_000),
       });
-      if (!script.ok) throw new Error(`petdex 没有名为 ${slug} 的宠物（HTTP ${script.status}）`);
-      const files = parseInstallScript(await script.text());
-      if (files.length === 0) throw new Error(`无法解析 petdex 安装脚本（${slug}）`);
-      for (const file of files) {
-        const name = basename(file.name) || 'spritesheet.webp';
-        await download(file.url, join(stagingDir, name), { log });
+      if (response.status === 404) throw new Error(`Petdex 找不到宠物 ${slug}`);
+      if (!response.ok) throw new Error(`Petdex 安装接口返回 HTTP ${response.status}（${slug}）`);
+      const payload = await response.json();
+      const pet = payload?.pet;
+      if (payload?.ok !== true || pet?.slug !== slug || !['png', 'webp'].includes(pet.spriteExt)) {
+        throw new Error(`Petdex 返回的宠物资料不完整（${slug}）`);
       }
-      // petdex 脚本把 spritesheet 存成 spritesheet.webp，但 pet.json 里写的是
-      // spritesheetPath；两者不一致时补一份规范名，保证校验走的路径确定
+      const assets = [
+        [pet.petJsonUrl, 'pet.json'],
+        [pet.spritesheetUrl, 'spritesheet.' + pet.spriteExt],
+      ];
+      for (const [value, name] of assets) {
+        const url = URL.parse(value);
+        if (!url || url.origin !== 'https://assets.petdex.dev' || url.username || url.password) {
+          throw new Error(`Petdex 返回了无效素材地址（${name}）`);
+        }
+        await download(url.href, join(stagingDir, name), { fetchImpl, log });
+      }
       const petJsonPath = join(stagingDir, 'pet.json');
       const petJson = JSON.parse(await readFile(petJsonPath, 'utf8'));
       const declared = typeof petJson.spritesheetPath === 'string' ? basename(petJson.spritesheetPath) : '';

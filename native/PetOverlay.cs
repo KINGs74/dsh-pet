@@ -294,7 +294,7 @@ namespace DshPet
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Log.W("overlay start version=0.3.6 host=" + opts.Host + " prefix=" + opts.Prefix + " dshPid=" + opts.DshPid);
+            Log.W("overlay start version=0.4.1 host=" + opts.Host + " prefix=" + opts.Prefix + " dshPid=" + opts.DshPid);
             Application.Run(new PetForm(opts));
             Log.W("overlay exit");
             GC.KeepAlive(mutex);

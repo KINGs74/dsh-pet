@@ -1,6 +1,6 @@
 {
   "name": "dsh-pet",
-  "version": "0.3.6",
+  "version": "0.4.1",
   "private": false,
   "description": "DSH 智能伙伴浮层：常驻桌面的 petdex 宠物，显示对话进展、任务结束提醒、全屏拖动、就地输入",
   "type": "module",
@@ -19,7 +19,8 @@
     "tools",
     "icon.svg",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "docs/previews"
   ],
   "engines": {
     "node": ">=22.6.0",

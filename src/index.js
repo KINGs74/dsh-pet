@@ -233,9 +233,13 @@ class PetService {
     return 'ok';
   }
 
+  installingPet = false;
+
   async install(source) {
     const text = String(source ?? '').trim();
     if (!text) return '请填写宠物名称、链接或本地路径';
+    if (this.installingPet) return "正在安装另一只宠物，请稍后再试";
+    this.installingPet = true;
     this.log(`开始安装宠物：${text}`);
     try {
       const pet = await installPet(text, { root: PETS_ROOT, psPath: this.psPath, log: this.log });
@@ -247,6 +251,8 @@ class PetService {
       const message = error?.message ?? String(error);
       this.log(`安装失败：${message}`);
       return `安装失败：${message}`;
+    } finally {
+      this.installingPet = false;
     }
   }
 

@@ -51,7 +51,7 @@ export class OverlayCompose {
 
   bind(controller) {
     this.dispose();
-    const binding = { controller, lifetime: new AbortController() };
+    const binding = { controller, lifetime: new AbortController(), newSessions: new Map() };
     this.#binding = binding;
     return () => {
       if (this.#binding === binding) this.dispose();
@@ -111,14 +111,35 @@ export class OverlayCompose {
     if (typeof binding?.controller?.list !== 'function' || typeof binding.controller.prompt !== 'function') {
       return reply('failed', 'DSH 会话接口暂不可用', 'The DSH session controller is unavailable.');
     }
-    let items;
-    try {
-      items = await this.#list(binding);
-    } catch {
-      return reply('failed', '无法确认发送目标，请重试', 'Could not verify the target session. Try again.');
-    }
-    if (!items.some((item) => item.sessionId === targetId)) {
-      return reply('failed', '所选会话已不可用，请重新选择', 'The selected session is unavailable. Choose another session.');
+    if (targetId === '@new') {
+      if (typeof binding.controller.create !== 'function') {
+        return reply('failed', '当前 DSH 无法新建会话', 'This DSH version cannot create a session.');
+      }
+      const id = canonicalRequestId(requestId);
+      let pending = binding.newSessions.get(id);
+      if (!pending) {
+        pending = Promise.resolve().then(() => binding.controller.create({}));
+        binding.newSessions.set(id, pending);
+        pending.catch(() => binding.newSessions.delete(id));
+      }
+      try {
+        const signal = AbortSignal.any([binding.lifetime.signal, AbortSignal.timeout(this.listTimeout)]);
+        const created = await within(signal, () => pending);
+        if (typeof created?.sessionId !== 'string' || !created.sessionId) throw new Error('Missing session ID');
+        targetId = created.sessionId;
+      } catch {
+        return reply('failed', '新建会话未完成，可重试同一草稿', 'The new session could not be confirmed. Retry the same draft.');
+      }
+    } else {
+      let items;
+      try {
+        items = await this.#list(binding);
+      } catch {
+        return reply('failed', '无法确认发送目标，请重试', 'Could not verify the target session. Try again.');
+      }
+      if (!items.some((item) => item.sessionId === targetId)) {
+        return reply('failed', '所选会话已不可用，请重新选择', 'The selected session is unavailable. Choose another session.');
+      }
     }
     if (binding.lifetime.signal.aborted) {
       return reply('failed', '插件正在重载，请重试', 'The plugin is reloading. Try again.');
